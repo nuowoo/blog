@@ -1,0 +1,1260 @@
+<!DOCTYPE html>
+<html data-color-mode="light" data-dark-theme="dark" data-light-theme="light" lang="zh-CN">
+<head>
+    <meta content="text/html; charset=utf-8" http-equiv="content-type" />
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <link href='https://mirrors.sustech.edu.cn/cdnjs/ajax/libs/Primer/21.0.7/primer.css' rel='stylesheet' />
+    
+    <link rel="icon" href="https://github.githubassets.com/favicons/favicon.svg"><script>
+        let theme = localStorage.getItem("meek_theme") || "light";
+        document.documentElement.setAttribute("data-color-mode", theme);
+    </script>
+<meta name="description" content="
+[Differential dataflow](https://github.com/TimelyDataflow/differential-dataflow) has a single join operator: `join`.
+It takes two input collections, and for each `(key, val1)` and `(key, val2)` in the inputs it produces `(key, (val1, val2))` in the output.
+This makes `join` a 'binary equijoin', where it fishes out exactly the exact matches on `key`.
+This restriction is important, and powerful: when either input experiences a change, the `key` of the change is what directs us to the (other) input records that will help us produce the appropriate output change.
+However, there are other 'joins' in the larger relational data world, and we need to support them as well.
+
+In this post we'll build up an implementation of a **multi-way outer equijoin**.
+We'll start small, but arrive at the best way I know how to build these beasts out of existing parts.
+Along the way, we'll 
+    get an introduction to how differential dataflow works, 
+    develop several ways to use it to implement joins of various stripes, and
+    deploy these techniques together to take on the outer-est of (equi-)joins.
+
+Amazingly, to me at least, we end up needing to understand how to efficiently implement multi-way joins of sums of terms.
+That is, how to efficiently implement
+```
+(A0 + A1 + A2) ⋈ (B0 + B1 + B2) ⋈ (C0 + ...) ⋈ ...
+```
+To be honest, I can't recall this pattern from my database education (such as it was), and I'd love any tips or pointers about where else this shows up.
+If you get to the end and it all checks out as old-hat for you, I'd love to know about it!
+
+### Differential Dataflow and the Binary Equijoin `join`
+
+Differential dataflow is a framework for computing and then maintaining functions over continually changing volumes of data.
+It manipulates *updates* to data, written as triples `(data, time, diff)` and indicating that at `time` the number of occurrences of `data` changes by `diff`.
+Differential dataflow provides primitive operators like `map`, `filter`, `join`, `reduce`, and `iterate`, which users compose to build more complex functions.
+Each operator translates input updates into the output updates that would result from continually re-evaluating the operator at every time. 
+Similarly, the composed dataflow of operators similarly produces output updates that correspond exactly to continual reevaluation on the changing inputs.
+
+The `join` operator applies to two input collections, for which their `data` have the shape `(key, _)`: pairs of some common 'key' type and potentially unrelated 'value' types.
+The intended output is a tuple `(key, (val1, val2))` for each pair of inputs that have a matching `key`.
+The output updates can be derived from first principles, but with enough head-scratching one can conclude that each pair of updates with matching key produces one output update:
+
+```   
+    update1: ((key, val1), time1, diff1)     -- First input
+    update2: ((key, val2), time2, diff2)     -- Second input
+-> 
+    ((key, (val1, val2)),  max(time1, time2),  diff1 * diff2)
+     \-- output data --/   \----  time ----/   \--  diff --/
+```
+
+We can respond to each input update by iterating over the updates in the *other* input with the same key, and use the rule above.
+There are smarter ways to do this, consider for example the second update introducing and retracting a record before `time1`: we would produce two outputs that exactly cancel.
+In any case, we'll need to retain *some* information about each input, ideally arranged by `key` so that these updates can be efficiently retrieved.
+
+Differential dataflow has a primitive called an 'arrangement', which is both a stream of updates and a maintained indexed form of their accumulation.
+An arrangement translates a stream of updates into a sequence of indexed 'batches' of updates, each of which are indexed by `key`.
+It also maintains a collection of these batches that serve as an indexed roll-up of the accumulated updates, using a structure analogous to a [log-structured merge-tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree).
+Arrangements are the primary mechanism to maintain 'state' as a dataflow runs, and specifically are what `join` uses: each input to `join` must be an arrangement, and if they are not then they will be arranged for you.
+
+### Technique 1: Shared Arrangements
+
+A key advantage to using arrangements is that they can be [*shared*](http://www.vldb.org/pvldb/vol13/p1793-mcsherry.pdf).
+Arranged data can be used by any number of dataflows, avoiding the cost of an additional redundant arrangement.
+As an example, imagine we have a collection of link data `(source, target)`, and we would like to compute and maintain those identifiers within three steps of some query set `query`.
+If the data are arranged, say in an arrangement named `links`, we could write
+```rust
+// Join `query` against `links` three times, giving
+// the identifiers three steps away from each query.
+query.map(|query| (query, query))
+     .join(links).map(|(step0, (query, step1))| (step1, query))
+     .join(links).map(|(step1, (query, step2))| (step2, query))
+     .join(links).map(|(step2, (query, step3))| (step3, query))
+```
+This fragment would naively require six arrangements, two for each `join` invocation.
+However, we are able to re-use the `links` arrangement at no cost, and instead only introduce three arrangements, corresponding to the number of steps (0, 1, and 2) out from `query`.
+These new arrangements can be substantially smaller than `links`, and the amount of work required to compute and maintain the results can be trivial even when `links` is enormous.
+
+### Technique 2: Functional Joins
+
+This one is a bit of cheat, in that by the end of it you may not be sure it is even a join.
+
+There are times, and we will see them coming up, where we want to join not against *data* but against a *function*.
+For example, perhaps we have a collection of `(line, text)` of pairs of integers and strings, and we would like to split each `text` into the words it contains.
+One way to do this is with `join`: the first input is our lines of text, and the second input is the quite large collection of pairs `(text, (pos, word))` each indicating a word that can be found in `text`.
+
+Rather than hope to implement this with `join`, because we couldn't hope to maintain the second collection, we could implement this with the `flat_map` operator instead.
+```rust
+// Convert each `text` into the words it contains.
+lines.flat_map(|(line, text)| 
+    text.split_whitespace()
+        .enumerate()
+        .map(|(pos, word)| (line, text.clone(), (pos, word.to_owned())))
+)
+```
+
+At this point you may be wondering why we have called this a 'functional join' rather than a 'flat map'.
+You are not wrong that `flat_map` is the best way to implement this.
+However, we will need to prepare ourselves to see this pattern in joins, and understand that it is one way to implement something that may present as a `join`.
+Each input record results in zero or many output records, determined by some key fields in the record.
+
+### Technique 3: Multi-way Joins
+
+Even managing a single join can be challenging, but invariably folks actually want to perform multiple joins at once.
+Recall our `query` and `links` example, from just up above
+```rust
+// Join `query` against `links` three times, giving
+// the identifiers three steps away from each query.
+query.map(|query| (query, query))
+     .join(links).map(|(step0, (query, step1))| (step1, query))
+     .join(links).map(|(step1, (query, step2))| (step2, query))
+     .join(links).map(|(step2, (query, step3))| (step3, query))
+```
+This performs three joins, and introduces new arrangements for the left inputs of each of the three `join` calls.
+We argued that this could be small if `query` is small, and also if each of the intermediate results are small.
+But if this isn't the case, then they might be large, and we might end up maintaining quite a lot of information.
+
+Let's take a different example that might not be so easy.
+Imagine you start with a collection `facts` of raw data, and you want to enrich it using dimesion tables that translate foreign keys like 'user id' into further detail.
+The additional detail may result in further keys you want to unpack, like addresses, zipcodes, and the sales agents they map to.
+```rust
+// Enrich facts with user, address, and sales agent information.
+facts.map(|fact| (fact.user_id, fact)).join(users).map( .. )
+     .map(|fact| (fact.addr_id, fact)).join(addrs).map( .. )
+     .map(|fact| (fact.zipcode, fact)).join(agent).map( .. )
+```
+Lots and lots of data pipelines have this sort of enrichment in them, in part because 'normalized' database best practices are to factor apart this information.
+Unfortunately, stitching it back together efficiently is an important part of these best practices.
+
+For this query, we may have arrangements of `users`, `addrs`, `agent`.
+However, we are unlikely to have arrangements of the left inputs to each of the `join`s.
+The very first left input, `facts` keyed by `user_id`, is plausibly something we might have pre-arranged, but the other two result from the query itself.
+Naively implemented, we'll create second and third arrangements of enriched `fact` data, which can be really quite large.
+
+Fortunately, there is a trick for multiway joins that I have no better name for than ['delta joins'](https://github.com/TimelyDataflow/differential-dataflow/tree/master/dogsdogsdogs).
+The gist is that rather than plan a multiway join as a sequence (or tree) of binary joins, as done in System R, you describe how the whole join will vary as a function of each input.
+You can get this derivation by expanding out our derivation for binary joins, in terms of input updates, to multiple inputs.
+You then independently implement each of these response functions for each input as best as you can and then compose their results.
+
+For example, our query above joins four relations: `facts`, `users`, `addrs`, and `agent`, subject to some equality constraints.
+When `facts` changes, we need to look up enrichments in `users`, then `addrs`, then `agent` to find the change to enriched facts.
+When `agent` changes, we need to find the affected `addrs`, then `users`, then `facts`, in order to update the enrichment of existing facts.
+
+```
+-- rules for how to react to an update to each input.
+-- elided: equality constraints for each join (⋈).
+d_query/d_facts = d_facts ⋈ users ⋈ addrs ⋈ agent
+d_query/d_users = d_users ⋈ addrs ⋈ agent ⋈ facts
+d_query/d_addrs = d_addrs ⋈ agent ⋈ users ⋈ facts
+d_query/d_agent = d_agent ⋈ addrs ⋈ users ⋈ facts
+```
+The overall changes to `query` result from adding together these update rules.
+
+What's different above is that each of the `d_term ⋈` joins are *ephemeral*: no one needs to remember the `d_` part of the input.
+Each of these rules are implementable with what differential dataflow calls a `half_join`: an operator that responds to records in one input by look-ups into a second, and which does not respond to changes to the second input.
+The `half_join` operator needs an arrangement of its second input, but not of its first input.
+
+This pattern has different arrangement requirements than the sequence of binary `join` operators.
+Each collection needs an arrangement by those attributes by which it may be interrogated.
+In the example above, the required arrangements end up being:
+
+1. input `facts` arranged by `user_id`,
+2. input `users` arranged by `user_id` and also by `addr_id`,
+3. input `addrs` arranged by `addr_id` and also by `zipcode`,
+4. input `agent` arranged by `zipcode`.
+
+This ends up being six arrangements, just like before, but they are all arrangements we might reasonably have ahead of time.
+The *incremental* arrangement cost of the query can be zero, if these arrangement are all pre-built.
+
+### Boss Battle: Left Outer Joins
+
+An 'outer' join is a SQL construct that is much like an standard ('inner') join except that any records that 'miss', i.e. do not match any other records, are still produced as output but with `NULL` values in columns we hoped to populate.
+Outer joins are helpful in best-effort joins, where you hope to enrich some data, but can't be certain you'll find the enrichment and don't want to lose the input data if you cannot.
+
+For example, consider our `facts`, `users`, `addrs`, and `agent` scenario just above.
+What would happen if there is a `user_id` that does not exist in `users`, or a `addr_id` that does not exist in `addrs`, or a `zipcode` that does not exist in `agent`?
+Written as a conventional join, we would simply drop such records on the floor and never speak of them.
+Sometimes that is the right thing to do, but often you want to see the data along with any *failures* to find the enrichments.
+
+If we take our example from above but use `LEFT JOIN` instead of `join`, we will keep even facts that do not match `users`, `addrs`, or `agent`.
+```sql
+-- Enrich facts with more data, but don't lose any.
+facts LEFT JOIN users ON (facts.user_id = users.id)
+      LEFT JOIN addrs ON (users.addr_id = addrs.id)
+      LEFT JOIN agent ON (addrs.zipcode = agent.zc)
+```
+
+There are also `RIGHT` and `FULL` joins, which respectively go in the other direction (e.g. output users that match no facts, with null fact columns) and in both directions (all bonus records that would be added to a `LEFT` or `RIGHT` join).
+We are only going to noodle on `LEFT` joins, though the noodling should generalize just fine.
+
+To implement left joins, we'll need to find a way to express them in terms of the tools we have.
+Those tools are .. the operators differential dataflow provides; things like `map`, `filter`, `join`, and `reduce` (no `iterate`. NO!).
+
+### Step one: turn LEFT JOINs into JOINs
+
+When we left join two collections, some records match perfectly as in an inner join, and some do not.
+What do we have to add to the results of the inner join to get the correct answer?
+Specifically, any keys that might be present in the first input, but are not present in the second input, could just be added to the second input with `NULL` values.
+
+```sql
+-- Some facts exactly match some entry in users.
+SELECT * FROM facts INNER JOIN users ON (facts.user_id = users.id)
+-- Some facts totally miss, but need to match something.
+UNION ALL
+SELECT facts.*, NULL FROM facts
+WHERE facts.user_id NOT IN (SELECT id FROM users)
+```
+This construction keeps the `INNER JOIN` pristine, but adds in `facts` extended by `NULL`s for any fact whose `user_id` is not found in `users`.
+Although not totally clear, `NOT IN` results in a join between `facts` and distinct `users.id`.
+This approach feels good, re-uses arrangements on `facts` and `users`, and is pretty close to what Materialize does for you at the moment.
+
+However, this technique is not great for multiway outer joins.
+We need access to the left input (here: `facts`) to complete the outer join, and generally that input is the result of the outer join just before this one.
+If we need to have that answer to form this query fragment, we don't have a story for how they all become one multiway inner join.
+Likewise, Materialize currently plans a multiway outer join as a *sequence* of fragments like above that *involve* inner joins, but are not *an* inner join.
+
+### Step two: Multiway LEFT JOINS into Multiway JOINs
+
+Let's take the intuition above and see if we can preserve the join structure.
+We want to produce a SQL fragment that is at its root just an inner join.
+We will need to be careful that it should rely on base tables, not its direct inputs (what?).
+
+Let's start and we'll see where we get.
+
+First, let's rewrite the above fragment in a way that looks more like *one* inner join.
+One one side we have `facts`, and on the other side .. at least `users` but also some other stuff?
+For a first cut, that 'other stuff' is .. the `user_id`s in `facts` but not in `users`?
+We could add those rows to `users`, with `NULL` values in missing columns, and see what we get!
+
+As it turns out we get totally the wrong answer. 
+Best intentions, of course, but the wrong answer.
+I believe the right answer is expressed roughly this way, in SQL:
+
+```sql
+-- Some facts exactly match some entry in users.
+SELECT facts.*, users.* 
+FROM facts INNER JOIN users ON (facts.user_id = users.id)
+-- Some facts totally miss, but could match something.
+UNION ALL
+WITH absent(id) AS (
+    SELECT user_id FROM facts 
+    EXCEPT 
+    SELECT id FROM users
+)
+SELECT facts.*, NULL 
+FROM facts INNER JOIN absent ON (facts.user_id = absent.id)
+-- Some facts have NULL `user_id` and refuse to be joined.
+UNION ALL
+SELECT facts.*, NULL
+FROM facts WHERE facts.user_id IS NULL
+```
+
+We do grab the `absent` keys, but importantly we produce `NULL` in their key columns.
+We also need to deal with potentially null `user_id` values, which we do in the third clause, because SQL's `NULL` values do not equal themselves.
+Again, best intentions, I'm sure.
+
+The good news is that we have framed the SQL in a way that looks like (taking some notational liberties):
+```
+  facts ⋈ users
++ facts ⋈ absent    -- with null outputs
++ facts ⋈ NULLs     -- only for null user_id
+```
+Each of the three joins are slightly different, but they all have the property that `facts` arranged by `user_id` is enough for them.
+We can and will now factor out `facts` from these three terms, which puts us in a position to write our multiway left join as:
+
+```
+-- Left join of facts, users, addrs, and agent.
+facts ⋈ (users + absent(users) + NULL)
+      ⋈ (addrs + absent(addrs) + NULL)
+      ⋈ (agent + absent(agent) + NULL)
+```
+This is starting to look a bit more like the joins over sums of terms advertised in the beginning of the post.
+For the moment, we are just going to add together the terms, though.
+
+There is quite a lot unsaid here, and the nature of the ⋈ varies a bit for each of the terms in parentheses.
+You do have to populate the `absent(foo)` collections with values from base relations, rather than their immediate inputs.
+And fortunately, SQL notwithstanding, differential dataflow *does* equate NULL with itself, and everything works out just fine.
+Materialize [recently merged](https://github.com/MaterializeInc/materialize/pull/24345) an approach that looks like this for multiway outer joins.
+It's early days, but we'll soon start exploring how this work for folks with stacks of left joins.
+
+But the story doesn't end here. 
+Somewhat stressfully, this approach takes existing inputs `facts`, `users`, `addrs`, and `agent` and .. fails to use any of their pre-existing arrangements.
+It has some other performance issues as well.
+
+### Step three: Rendering JOINs of UNIONs
+
+The last step, or next step at least .. perhaps not the last, is to render these query plans efficiently.
+At the moment we have no better plan than to treat the augmented collections as new collections, arrange them, and join them.
+Roughly like so:
+```
+-- Left join of facts, users, addrs, and agent.
+with users_aug as (users + absent(users) + NULL)
+with addrs_aug as (addrs + absent(users) + NULL)
+with agent_aug as (agent + absent(agent) + NULL)
+facts ⋈ users_aug ⋈ addrs_aug ⋈ agent_aug
+```
+
+These `_aug` collections are as big (somewhat bigger) than their unaugmented counterparts, and it feels somewhat bad to re-arrange them.
+It feels bad that despite pre-arranging `users`, `addrs`, and `agent` we can re-use none of them.
+It feels bad that all `NULL` values will be routed to a single worker just to find out that they map to `NULL`; lots of work for no surprise.
+
+However, we can get around all of these bad feels with some dataflow shenanigans.
+Unfortunately, they are shenanigans that as far as I can tell neither Materialize nor SQL can describe.
+
+We have two strategies for evaluating multiway joins: as a sequence of binary joins, and using delta join rules.
+The shenanigans are easier with the sequence of binary joins, so let's start there.
+We are going to do something as simple as re-distributing over the `⋈` operator, performing each join the way we want.
+We then add up the results of each step of the join rather than adding up the inputs to each step of the join.
+
+```
+-- Left join of facts, users, addrs, and agent.
+step0 = facts;
+step1 = step0 ⋈ users + step0 ⋈ absent(users) + step0 ⋈ NULL;
+step2 = step1 ⋈ addrs + step1 ⋈ absent(addrs) + step1 ⋈ NULL;
+step3 = step2 ⋈ agent + step2 ⋈ absent(agent) + step2 ⋈ NULL;
+step3
+```
+Each of these ⋈ operators are slightly different. 
+The first ⋈ in each row is the traditional equijoin.
+The second ⋈ in each row is an equijoin that projects away matched keys and puts `NULL` in their place.
+The third ⋈ in each row only matches nulls.
+
+However, in each line we only have to arrange non-null `stepx` and determine and arrange `absent(foo)`. 
+We can re-use existing arrangements of `users`, `addrs`, and `agent`.
+The join with `NULL` can be implemented as a `flat_map` rather than by co-locating all null records for a `join` (omg finally explained).
+
+In actual fact, we can implement this in both SQL and Materialize, but in doing so we'll lose the multiway join planning benefit of avoiding intermediate arrangements.
+We will need to arrange `stepx` for each `x`, and the nice folks with stack of left joins 30+ deep (yes, seriously) will be sitting on 30x as much data as they feel they should.
+
+To recover the benefits, let's grab the delta join construction from way up above. 
+I'll use `_aug` suffixes to remind us that it isn't going to be as easy as joining against the pre-arranged collections.
+```
+-- rules for how to react to an update to each input.
+-- elided: equality constraints for each join (⋈).
+d_query/d_facts     = d_facts     ⋈ users_aug ⋈ addrs_aug ⋈ agent_aug
+d_query/d_users_aug = d_users_aug ⋈ addrs_aug ⋈ agent_aug ⋈ facts
+d_query/d_addrs_aug = d_addrs_aug ⋈ agent_aug ⋈ users_aug ⋈ facts
+d_query/d_agent_aug = d_agent_aug ⋈ addrs_aug ⋈ users_aug ⋈ facts
+```
+Ignore for the moment the fact that `d_users_aug` is complicated (an update to `users` may induce the opposite update to `absent(users)`).
+Each line up above describes a sequence of `half_join` applications, which like `join` also distributes over `+`.
+
+```
+  d_query/d_facts    
+= d_facts ⋈ users_aug ⋈ addrs_aug ⋈ agent_aug
+= ( 
+    d_step0 = d_facts;
+    d_step1 = d_step0 ⋈ users + d_step0 ⋈ absent(users) + d_step0 ⋈ NULL;
+    d_step2 = d_step1 ⋈ addrs + d_step1 ⋈ absent(addrs) + d_step1 ⋈ NULL;
+    d_step3 = d_step2 ⋈ agent + d_step2 ⋈ absent(agent) + d_step2 ⋈ NULL;
+    d_step3
+)
+```
+Each time we need to do a `half_join`, we can unpack the right argument to it and conduct the half join as we see fit.
+We can either `half_join` with a pre-existing arrangement, `half_join` with a new arrangement of absent values, or `flat_map` some `NULL` values into place.
+
+Writing the whole thing out is exhausting, especially for 30-deep stacks of left joins.
+Fortunately this is something computers are good at.
+Much like it now seems that they may be good at computing and maintaining deep stacks of left equijoins.
+
+### What's next?
+
+There is an expressivity gap to close between SQL/Materialize and differential dataflow.
+I'm not aware of a SQL-to-SQL rewrite that gets us the desired implementation, because we cannot afford to distribute the joins out across the unions, and SQL does not have a `half_join` operator.
+We're pondering options now, including expanding our lowest level IR to reflect e.g. half joins, and tweaking the renderer to recognize the idiom of joins between sums of terms.
+There will certainly be some amount of measurement as we try and assess the remaining gap, and draw down the amount of time and resources spent on outer joins.
+
+I have a concurrent effort to spread the gospel of [referential integrity](https://en.wikipedia.org/wiki/Referential_integrity) so that we can turn those outer joins to inner joins.
+You can understand how in weakly consistent systems you'd need the outer joins to cover for inconsistencies, but do you need it in a strongly consistent system like Materialize?
+
+Of course, if you've read this far you have an obligation to fill me in on what I've missed about all of this.
+Is there an easier transform, one that doesn't end up joining terms that are themselves sums of useful constituents?
+Do you have an exciting use case for maintaining stacks of outer joins, and you've been burned before?
+Do reach out in these cases, and [take Materialize for a spin](https://materialize.com/register/) (though, if you have stacks of 30+ left joins, please reach out for some personal attention).。">
+<meta property="og:title" content="Computing and Maintaining Weird (Outer) Joins">
+<meta property="og:description" content="
+[Differential dataflow](https://github.com/TimelyDataflow/differential-dataflow) has a single join operator: `join`.
+It takes two input collections, and for each `(key, val1)` and `(key, val2)` in the inputs it produces `(key, (val1, val2))` in the output.
+This makes `join` a 'binary equijoin', where it fishes out exactly the exact matches on `key`.
+This restriction is important, and powerful: when either input experiences a change, the `key` of the change is what directs us to the (other) input records that will help us produce the appropriate output change.
+However, there are other 'joins' in the larger relational data world, and we need to support them as well.
+
+In this post we'll build up an implementation of a **multi-way outer equijoin**.
+We'll start small, but arrive at the best way I know how to build these beasts out of existing parts.
+Along the way, we'll 
+    get an introduction to how differential dataflow works, 
+    develop several ways to use it to implement joins of various stripes, and
+    deploy these techniques together to take on the outer-est of (equi-)joins.
+
+Amazingly, to me at least, we end up needing to understand how to efficiently implement multi-way joins of sums of terms.
+That is, how to efficiently implement
+```
+(A0 + A1 + A2) ⋈ (B0 + B1 + B2) ⋈ (C0 + ...) ⋈ ...
+```
+To be honest, I can't recall this pattern from my database education (such as it was), and I'd love any tips or pointers about where else this shows up.
+If you get to the end and it all checks out as old-hat for you, I'd love to know about it!
+
+### Differential Dataflow and the Binary Equijoin `join`
+
+Differential dataflow is a framework for computing and then maintaining functions over continually changing volumes of data.
+It manipulates *updates* to data, written as triples `(data, time, diff)` and indicating that at `time` the number of occurrences of `data` changes by `diff`.
+Differential dataflow provides primitive operators like `map`, `filter`, `join`, `reduce`, and `iterate`, which users compose to build more complex functions.
+Each operator translates input updates into the output updates that would result from continually re-evaluating the operator at every time. 
+Similarly, the composed dataflow of operators similarly produces output updates that correspond exactly to continual reevaluation on the changing inputs.
+
+The `join` operator applies to two input collections, for which their `data` have the shape `(key, _)`: pairs of some common 'key' type and potentially unrelated 'value' types.
+The intended output is a tuple `(key, (val1, val2))` for each pair of inputs that have a matching `key`.
+The output updates can be derived from first principles, but with enough head-scratching one can conclude that each pair of updates with matching key produces one output update:
+
+```   
+    update1: ((key, val1), time1, diff1)     -- First input
+    update2: ((key, val2), time2, diff2)     -- Second input
+-> 
+    ((key, (val1, val2)),  max(time1, time2),  diff1 * diff2)
+     \-- output data --/   \----  time ----/   \--  diff --/
+```
+
+We can respond to each input update by iterating over the updates in the *other* input with the same key, and use the rule above.
+There are smarter ways to do this, consider for example the second update introducing and retracting a record before `time1`: we would produce two outputs that exactly cancel.
+In any case, we'll need to retain *some* information about each input, ideally arranged by `key` so that these updates can be efficiently retrieved.
+
+Differential dataflow has a primitive called an 'arrangement', which is both a stream of updates and a maintained indexed form of their accumulation.
+An arrangement translates a stream of updates into a sequence of indexed 'batches' of updates, each of which are indexed by `key`.
+It also maintains a collection of these batches that serve as an indexed roll-up of the accumulated updates, using a structure analogous to a [log-structured merge-tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree).
+Arrangements are the primary mechanism to maintain 'state' as a dataflow runs, and specifically are what `join` uses: each input to `join` must be an arrangement, and if they are not then they will be arranged for you.
+
+### Technique 1: Shared Arrangements
+
+A key advantage to using arrangements is that they can be [*shared*](http://www.vldb.org/pvldb/vol13/p1793-mcsherry.pdf).
+Arranged data can be used by any number of dataflows, avoiding the cost of an additional redundant arrangement.
+As an example, imagine we have a collection of link data `(source, target)`, and we would like to compute and maintain those identifiers within three steps of some query set `query`.
+If the data are arranged, say in an arrangement named `links`, we could write
+```rust
+// Join `query` against `links` three times, giving
+// the identifiers three steps away from each query.
+query.map(|query| (query, query))
+     .join(links).map(|(step0, (query, step1))| (step1, query))
+     .join(links).map(|(step1, (query, step2))| (step2, query))
+     .join(links).map(|(step2, (query, step3))| (step3, query))
+```
+This fragment would naively require six arrangements, two for each `join` invocation.
+However, we are able to re-use the `links` arrangement at no cost, and instead only introduce three arrangements, corresponding to the number of steps (0, 1, and 2) out from `query`.
+These new arrangements can be substantially smaller than `links`, and the amount of work required to compute and maintain the results can be trivial even when `links` is enormous.
+
+### Technique 2: Functional Joins
+
+This one is a bit of cheat, in that by the end of it you may not be sure it is even a join.
+
+There are times, and we will see them coming up, where we want to join not against *data* but against a *function*.
+For example, perhaps we have a collection of `(line, text)` of pairs of integers and strings, and we would like to split each `text` into the words it contains.
+One way to do this is with `join`: the first input is our lines of text, and the second input is the quite large collection of pairs `(text, (pos, word))` each indicating a word that can be found in `text`.
+
+Rather than hope to implement this with `join`, because we couldn't hope to maintain the second collection, we could implement this with the `flat_map` operator instead.
+```rust
+// Convert each `text` into the words it contains.
+lines.flat_map(|(line, text)| 
+    text.split_whitespace()
+        .enumerate()
+        .map(|(pos, word)| (line, text.clone(), (pos, word.to_owned())))
+)
+```
+
+At this point you may be wondering why we have called this a 'functional join' rather than a 'flat map'.
+You are not wrong that `flat_map` is the best way to implement this.
+However, we will need to prepare ourselves to see this pattern in joins, and understand that it is one way to implement something that may present as a `join`.
+Each input record results in zero or many output records, determined by some key fields in the record.
+
+### Technique 3: Multi-way Joins
+
+Even managing a single join can be challenging, but invariably folks actually want to perform multiple joins at once.
+Recall our `query` and `links` example, from just up above
+```rust
+// Join `query` against `links` three times, giving
+// the identifiers three steps away from each query.
+query.map(|query| (query, query))
+     .join(links).map(|(step0, (query, step1))| (step1, query))
+     .join(links).map(|(step1, (query, step2))| (step2, query))
+     .join(links).map(|(step2, (query, step3))| (step3, query))
+```
+This performs three joins, and introduces new arrangements for the left inputs of each of the three `join` calls.
+We argued that this could be small if `query` is small, and also if each of the intermediate results are small.
+But if this isn't the case, then they might be large, and we might end up maintaining quite a lot of information.
+
+Let's take a different example that might not be so easy.
+Imagine you start with a collection `facts` of raw data, and you want to enrich it using dimesion tables that translate foreign keys like 'user id' into further detail.
+The additional detail may result in further keys you want to unpack, like addresses, zipcodes, and the sales agents they map to.
+```rust
+// Enrich facts with user, address, and sales agent information.
+facts.map(|fact| (fact.user_id, fact)).join(users).map( .. )
+     .map(|fact| (fact.addr_id, fact)).join(addrs).map( .. )
+     .map(|fact| (fact.zipcode, fact)).join(agent).map( .. )
+```
+Lots and lots of data pipelines have this sort of enrichment in them, in part because 'normalized' database best practices are to factor apart this information.
+Unfortunately, stitching it back together efficiently is an important part of these best practices.
+
+For this query, we may have arrangements of `users`, `addrs`, `agent`.
+However, we are unlikely to have arrangements of the left inputs to each of the `join`s.
+The very first left input, `facts` keyed by `user_id`, is plausibly something we might have pre-arranged, but the other two result from the query itself.
+Naively implemented, we'll create second and third arrangements of enriched `fact` data, which can be really quite large.
+
+Fortunately, there is a trick for multiway joins that I have no better name for than ['delta joins'](https://github.com/TimelyDataflow/differential-dataflow/tree/master/dogsdogsdogs).
+The gist is that rather than plan a multiway join as a sequence (or tree) of binary joins, as done in System R, you describe how the whole join will vary as a function of each input.
+You can get this derivation by expanding out our derivation for binary joins, in terms of input updates, to multiple inputs.
+You then independently implement each of these response functions for each input as best as you can and then compose their results.
+
+For example, our query above joins four relations: `facts`, `users`, `addrs`, and `agent`, subject to some equality constraints.
+When `facts` changes, we need to look up enrichments in `users`, then `addrs`, then `agent` to find the change to enriched facts.
+When `agent` changes, we need to find the affected `addrs`, then `users`, then `facts`, in order to update the enrichment of existing facts.
+
+```
+-- rules for how to react to an update to each input.
+-- elided: equality constraints for each join (⋈).
+d_query/d_facts = d_facts ⋈ users ⋈ addrs ⋈ agent
+d_query/d_users = d_users ⋈ addrs ⋈ agent ⋈ facts
+d_query/d_addrs = d_addrs ⋈ agent ⋈ users ⋈ facts
+d_query/d_agent = d_agent ⋈ addrs ⋈ users ⋈ facts
+```
+The overall changes to `query` result from adding together these update rules.
+
+What's different above is that each of the `d_term ⋈` joins are *ephemeral*: no one needs to remember the `d_` part of the input.
+Each of these rules are implementable with what differential dataflow calls a `half_join`: an operator that responds to records in one input by look-ups into a second, and which does not respond to changes to the second input.
+The `half_join` operator needs an arrangement of its second input, but not of its first input.
+
+This pattern has different arrangement requirements than the sequence of binary `join` operators.
+Each collection needs an arrangement by those attributes by which it may be interrogated.
+In the example above, the required arrangements end up being:
+
+1. input `facts` arranged by `user_id`,
+2. input `users` arranged by `user_id` and also by `addr_id`,
+3. input `addrs` arranged by `addr_id` and also by `zipcode`,
+4. input `agent` arranged by `zipcode`.
+
+This ends up being six arrangements, just like before, but they are all arrangements we might reasonably have ahead of time.
+The *incremental* arrangement cost of the query can be zero, if these arrangement are all pre-built.
+
+### Boss Battle: Left Outer Joins
+
+An 'outer' join is a SQL construct that is much like an standard ('inner') join except that any records that 'miss', i.e. do not match any other records, are still produced as output but with `NULL` values in columns we hoped to populate.
+Outer joins are helpful in best-effort joins, where you hope to enrich some data, but can't be certain you'll find the enrichment and don't want to lose the input data if you cannot.
+
+For example, consider our `facts`, `users`, `addrs`, and `agent` scenario just above.
+What would happen if there is a `user_id` that does not exist in `users`, or a `addr_id` that does not exist in `addrs`, or a `zipcode` that does not exist in `agent`?
+Written as a conventional join, we would simply drop such records on the floor and never speak of them.
+Sometimes that is the right thing to do, but often you want to see the data along with any *failures* to find the enrichments.
+
+If we take our example from above but use `LEFT JOIN` instead of `join`, we will keep even facts that do not match `users`, `addrs`, or `agent`.
+```sql
+-- Enrich facts with more data, but don't lose any.
+facts LEFT JOIN users ON (facts.user_id = users.id)
+      LEFT JOIN addrs ON (users.addr_id = addrs.id)
+      LEFT JOIN agent ON (addrs.zipcode = agent.zc)
+```
+
+There are also `RIGHT` and `FULL` joins, which respectively go in the other direction (e.g. output users that match no facts, with null fact columns) and in both directions (all bonus records that would be added to a `LEFT` or `RIGHT` join).
+We are only going to noodle on `LEFT` joins, though the noodling should generalize just fine.
+
+To implement left joins, we'll need to find a way to express them in terms of the tools we have.
+Those tools are .. the operators differential dataflow provides; things like `map`, `filter`, `join`, and `reduce` (no `iterate`. NO!).
+
+### Step one: turn LEFT JOINs into JOINs
+
+When we left join two collections, some records match perfectly as in an inner join, and some do not.
+What do we have to add to the results of the inner join to get the correct answer?
+Specifically, any keys that might be present in the first input, but are not present in the second input, could just be added to the second input with `NULL` values.
+
+```sql
+-- Some facts exactly match some entry in users.
+SELECT * FROM facts INNER JOIN users ON (facts.user_id = users.id)
+-- Some facts totally miss, but need to match something.
+UNION ALL
+SELECT facts.*, NULL FROM facts
+WHERE facts.user_id NOT IN (SELECT id FROM users)
+```
+This construction keeps the `INNER JOIN` pristine, but adds in `facts` extended by `NULL`s for any fact whose `user_id` is not found in `users`.
+Although not totally clear, `NOT IN` results in a join between `facts` and distinct `users.id`.
+This approach feels good, re-uses arrangements on `facts` and `users`, and is pretty close to what Materialize does for you at the moment.
+
+However, this technique is not great for multiway outer joins.
+We need access to the left input (here: `facts`) to complete the outer join, and generally that input is the result of the outer join just before this one.
+If we need to have that answer to form this query fragment, we don't have a story for how they all become one multiway inner join.
+Likewise, Materialize currently plans a multiway outer join as a *sequence* of fragments like above that *involve* inner joins, but are not *an* inner join.
+
+### Step two: Multiway LEFT JOINS into Multiway JOINs
+
+Let's take the intuition above and see if we can preserve the join structure.
+We want to produce a SQL fragment that is at its root just an inner join.
+We will need to be careful that it should rely on base tables, not its direct inputs (what?).
+
+Let's start and we'll see where we get.
+
+First, let's rewrite the above fragment in a way that looks more like *one* inner join.
+One one side we have `facts`, and on the other side .. at least `users` but also some other stuff?
+For a first cut, that 'other stuff' is .. the `user_id`s in `facts` but not in `users`?
+We could add those rows to `users`, with `NULL` values in missing columns, and see what we get!
+
+As it turns out we get totally the wrong answer. 
+Best intentions, of course, but the wrong answer.
+I believe the right answer is expressed roughly this way, in SQL:
+
+```sql
+-- Some facts exactly match some entry in users.
+SELECT facts.*, users.* 
+FROM facts INNER JOIN users ON (facts.user_id = users.id)
+-- Some facts totally miss, but could match something.
+UNION ALL
+WITH absent(id) AS (
+    SELECT user_id FROM facts 
+    EXCEPT 
+    SELECT id FROM users
+)
+SELECT facts.*, NULL 
+FROM facts INNER JOIN absent ON (facts.user_id = absent.id)
+-- Some facts have NULL `user_id` and refuse to be joined.
+UNION ALL
+SELECT facts.*, NULL
+FROM facts WHERE facts.user_id IS NULL
+```
+
+We do grab the `absent` keys, but importantly we produce `NULL` in their key columns.
+We also need to deal with potentially null `user_id` values, which we do in the third clause, because SQL's `NULL` values do not equal themselves.
+Again, best intentions, I'm sure.
+
+The good news is that we have framed the SQL in a way that looks like (taking some notational liberties):
+```
+  facts ⋈ users
++ facts ⋈ absent    -- with null outputs
++ facts ⋈ NULLs     -- only for null user_id
+```
+Each of the three joins are slightly different, but they all have the property that `facts` arranged by `user_id` is enough for them.
+We can and will now factor out `facts` from these three terms, which puts us in a position to write our multiway left join as:
+
+```
+-- Left join of facts, users, addrs, and agent.
+facts ⋈ (users + absent(users) + NULL)
+      ⋈ (addrs + absent(addrs) + NULL)
+      ⋈ (agent + absent(agent) + NULL)
+```
+This is starting to look a bit more like the joins over sums of terms advertised in the beginning of the post.
+For the moment, we are just going to add together the terms, though.
+
+There is quite a lot unsaid here, and the nature of the ⋈ varies a bit for each of the terms in parentheses.
+You do have to populate the `absent(foo)` collections with values from base relations, rather than their immediate inputs.
+And fortunately, SQL notwithstanding, differential dataflow *does* equate NULL with itself, and everything works out just fine.
+Materialize [recently merged](https://github.com/MaterializeInc/materialize/pull/24345) an approach that looks like this for multiway outer joins.
+It's early days, but we'll soon start exploring how this work for folks with stacks of left joins.
+
+But the story doesn't end here. 
+Somewhat stressfully, this approach takes existing inputs `facts`, `users`, `addrs`, and `agent` and .. fails to use any of their pre-existing arrangements.
+It has some other performance issues as well.
+
+### Step three: Rendering JOINs of UNIONs
+
+The last step, or next step at least .. perhaps not the last, is to render these query plans efficiently.
+At the moment we have no better plan than to treat the augmented collections as new collections, arrange them, and join them.
+Roughly like so:
+```
+-- Left join of facts, users, addrs, and agent.
+with users_aug as (users + absent(users) + NULL)
+with addrs_aug as (addrs + absent(users) + NULL)
+with agent_aug as (agent + absent(agent) + NULL)
+facts ⋈ users_aug ⋈ addrs_aug ⋈ agent_aug
+```
+
+These `_aug` collections are as big (somewhat bigger) than their unaugmented counterparts, and it feels somewhat bad to re-arrange them.
+It feels bad that despite pre-arranging `users`, `addrs`, and `agent` we can re-use none of them.
+It feels bad that all `NULL` values will be routed to a single worker just to find out that they map to `NULL`; lots of work for no surprise.
+
+However, we can get around all of these bad feels with some dataflow shenanigans.
+Unfortunately, they are shenanigans that as far as I can tell neither Materialize nor SQL can describe.
+
+We have two strategies for evaluating multiway joins: as a sequence of binary joins, and using delta join rules.
+The shenanigans are easier with the sequence of binary joins, so let's start there.
+We are going to do something as simple as re-distributing over the `⋈` operator, performing each join the way we want.
+We then add up the results of each step of the join rather than adding up the inputs to each step of the join.
+
+```
+-- Left join of facts, users, addrs, and agent.
+step0 = facts;
+step1 = step0 ⋈ users + step0 ⋈ absent(users) + step0 ⋈ NULL;
+step2 = step1 ⋈ addrs + step1 ⋈ absent(addrs) + step1 ⋈ NULL;
+step3 = step2 ⋈ agent + step2 ⋈ absent(agent) + step2 ⋈ NULL;
+step3
+```
+Each of these ⋈ operators are slightly different. 
+The first ⋈ in each row is the traditional equijoin.
+The second ⋈ in each row is an equijoin that projects away matched keys and puts `NULL` in their place.
+The third ⋈ in each row only matches nulls.
+
+However, in each line we only have to arrange non-null `stepx` and determine and arrange `absent(foo)`. 
+We can re-use existing arrangements of `users`, `addrs`, and `agent`.
+The join with `NULL` can be implemented as a `flat_map` rather than by co-locating all null records for a `join` (omg finally explained).
+
+In actual fact, we can implement this in both SQL and Materialize, but in doing so we'll lose the multiway join planning benefit of avoiding intermediate arrangements.
+We will need to arrange `stepx` for each `x`, and the nice folks with stack of left joins 30+ deep (yes, seriously) will be sitting on 30x as much data as they feel they should.
+
+To recover the benefits, let's grab the delta join construction from way up above. 
+I'll use `_aug` suffixes to remind us that it isn't going to be as easy as joining against the pre-arranged collections.
+```
+-- rules for how to react to an update to each input.
+-- elided: equality constraints for each join (⋈).
+d_query/d_facts     = d_facts     ⋈ users_aug ⋈ addrs_aug ⋈ agent_aug
+d_query/d_users_aug = d_users_aug ⋈ addrs_aug ⋈ agent_aug ⋈ facts
+d_query/d_addrs_aug = d_addrs_aug ⋈ agent_aug ⋈ users_aug ⋈ facts
+d_query/d_agent_aug = d_agent_aug ⋈ addrs_aug ⋈ users_aug ⋈ facts
+```
+Ignore for the moment the fact that `d_users_aug` is complicated (an update to `users` may induce the opposite update to `absent(users)`).
+Each line up above describes a sequence of `half_join` applications, which like `join` also distributes over `+`.
+
+```
+  d_query/d_facts    
+= d_facts ⋈ users_aug ⋈ addrs_aug ⋈ agent_aug
+= ( 
+    d_step0 = d_facts;
+    d_step1 = d_step0 ⋈ users + d_step0 ⋈ absent(users) + d_step0 ⋈ NULL;
+    d_step2 = d_step1 ⋈ addrs + d_step1 ⋈ absent(addrs) + d_step1 ⋈ NULL;
+    d_step3 = d_step2 ⋈ agent + d_step2 ⋈ absent(agent) + d_step2 ⋈ NULL;
+    d_step3
+)
+```
+Each time we need to do a `half_join`, we can unpack the right argument to it and conduct the half join as we see fit.
+We can either `half_join` with a pre-existing arrangement, `half_join` with a new arrangement of absent values, or `flat_map` some `NULL` values into place.
+
+Writing the whole thing out is exhausting, especially for 30-deep stacks of left joins.
+Fortunately this is something computers are good at.
+Much like it now seems that they may be good at computing and maintaining deep stacks of left equijoins.
+
+### What's next?
+
+There is an expressivity gap to close between SQL/Materialize and differential dataflow.
+I'm not aware of a SQL-to-SQL rewrite that gets us the desired implementation, because we cannot afford to distribute the joins out across the unions, and SQL does not have a `half_join` operator.
+We're pondering options now, including expanding our lowest level IR to reflect e.g. half joins, and tweaking the renderer to recognize the idiom of joins between sums of terms.
+There will certainly be some amount of measurement as we try and assess the remaining gap, and draw down the amount of time and resources spent on outer joins.
+
+I have a concurrent effort to spread the gospel of [referential integrity](https://en.wikipedia.org/wiki/Referential_integrity) so that we can turn those outer joins to inner joins.
+You can understand how in weakly consistent systems you'd need the outer joins to cover for inconsistencies, but do you need it in a strongly consistent system like Materialize?
+
+Of course, if you've read this far you have an obligation to fill me in on what I've missed about all of this.
+Is there an easier transform, one that doesn't end up joining terms that are themselves sums of useful constituents?
+Do you have an exciting use case for maintaining stacks of outer joins, and you've been burned before?
+Do reach out in these cases, and [take Materialize for a spin](https://materialize.com/register/) (though, if you have stacks of 30+ left joins, please reach out for some personal attention).。">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://nuowoo.github.io/blog/post/Computing%20and%20Maintaining%20Weird%20%28Outer%29%20Joins.html">
+<meta property="og:image" content="https://github.githubassets.com/favicons/favicon.svg">
+<title>Computing and Maintaining Weird (Outer) Joins</title>
+<link href="//unpkg.com/@wooorm/starry-night@2.1.1/style/both.css" rel="stylesheet" />
+
+
+</head>
+<style>
+body{box-sizing: border-box;min-width: 200px;max-width: 900px;margin: 20px auto;padding: 45px;font-size: 16px;font-family: sans-serif;line-height: 1.25;}
+#header{display:flex;padding-bottom:8px;border-bottom: 1px solid var(--borderColor-muted, var(--color-border-muted));margin-bottom: 16px;}
+#footer {margin-top:64px; text-align: center;font-size: small;}
+
+</style>
+
+<style>
+.postTitle{margin: auto 0;font-size:40px;font-weight:bold;}
+.title-right{display:flex;margin:auto 0 0 auto;}
+.title-right .circle{padding: 14px 16px;margin-right:8px;}
+#postBody{border-bottom: 1px solid var(--color-border-default);padding-bottom:36px;}
+#postBody hr{height:2px;}
+#cmButton{height:48px;margin-top:48px;}
+#comments{margin-top:64px;}
+.g-emoji{font-size:24px;}
+@media (max-width: 600px) {
+    body {padding: 8px;}
+    .postTitle{font-size:24px;}
+}
+.copy-feedback {
+    display: none;
+    position: absolute;
+    top: 10px;
+    right: 50px;
+    color: var(--color-fg-on-emphasis);
+    background-color: var(--color-fg-muted);
+    border-radius: 3px;
+    padding: 5px 8px;
+    font-size: 12px;
+}
+</style>
+
+
+
+
+<body>
+    <div id="header">
+<h1 class="postTitle">Computing and Maintaining Weird (Outer) Joins</h1>
+<div class="title-right">
+    <a href="https://nuowoo.github.io/blog" id="buttonHome" class="btn btn-invisible circle" title="首页">
+        <svg class="octicon" width="16" height="16">
+            <path id="pathHome" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+    
+    <a href="https://github.com/nuowoo/blog/issues/3" target="_blank" class="btn btn-invisible circle" title="Issue">
+        <svg class="octicon" width="16" height="16">
+            <path id="pathIssue" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+    
+
+    <a class="btn btn-invisible circle" onclick="modeSwitch();" title="切换主题">
+        <svg class="octicon" width="16" height="16" >
+            <path id="themeSwitch" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+
+</div>
+</div>
+    <div id="content">
+<div class="markdown-body" id="postBody"><p><a href="https://github.com/TimelyDataflow/differential-dataflow">Differential dataflow</a> has a single join operator: <code class="notranslate">join</code>.<br>
+It takes two input collections, and for each <code class="notranslate">(key, val1)</code> and <code class="notranslate">(key, val2)</code> in the inputs it produces <code class="notranslate">(key, (val1, val2))</code> in the output.<br>
+This makes <code class="notranslate">join</code> a "binary equijoin", where it fishes out exactly the exact matches on <code class="notranslate">key</code>.<br>
+This restriction is important, and powerful: when either input experiences a change, the <code class="notranslate">key</code> of the change is what directs us to the (other) input records that will help us produce the appropriate output change.<br>
+However, there are other "joins" in the larger relational data world, and we need to support them as well.</p>
+<p>In this post we'll build up an implementation of a <strong>multi-way outer equijoin</strong>.<br>
+We'll start small, but arrive at the best way I know how to build these beasts out of existing parts.<br>
+Along the way, we'll<br>
+get an introduction to how differential dataflow works,<br>
+develop several ways to use it to implement joins of various stripes, and<br>
+deploy these techniques together to take on the outer-est of (equi-)joins.</p>
+<p>Amazingly, to me at least, we end up needing to understand how to efficiently implement multi-way joins of sums of terms.<br>
+That is, how to efficiently implement</p>
+<pre class="notranslate"><code class="notranslate">(A0 + A1 + A2) ⋈ (B0 + B1 + B2) ⋈ (C0 + ...) ⋈ ...
+</code></pre>
+<p>To be honest, I can't recall this pattern from my database education (such as it was), and I'd love any tips or pointers about where else this shows up.<br>
+If you get to the end and it all checks out as old-hat for you, I'd love to know about it!</p>
+<h3>Differential Dataflow and the Binary Equijoin <code class="notranslate">join</code></h3>
+<p>Differential dataflow is a framework for computing and then maintaining functions over continually changing volumes of data.<br>
+It manipulates <em>updates</em> to data, written as triples <code class="notranslate">(data, time, diff)</code> and indicating that at <code class="notranslate">time</code> the number of occurrences of <code class="notranslate">data</code> changes by <code class="notranslate">diff</code>.<br>
+Differential dataflow provides primitive operators like <code class="notranslate">map</code>, <code class="notranslate">filter</code>, <code class="notranslate">join</code>, <code class="notranslate">reduce</code>, and <code class="notranslate">iterate</code>, which users compose to build more complex functions.<br>
+Each operator translates input updates into the output updates that would result from continually re-evaluating the operator at every time.<br>
+Similarly, the composed dataflow of operators similarly produces output updates that correspond exactly to continual reevaluation on the changing inputs.</p>
+<p>The <code class="notranslate">join</code> operator applies to two input collections, for which their <code class="notranslate">data</code> have the shape <code class="notranslate">(key, _)</code>: pairs of some common "key" type and potentially unrelated "value" types.<br>
+The intended output is a tuple <code class="notranslate">(key, (val1, val2))</code> for each pair of inputs that have a matching <code class="notranslate">key</code>.<br>
+The output updates can be derived from first principles, but with enough head-scratching one can conclude that each pair of updates with matching key produces one output update:</p>
+<pre class="notranslate"><code class="notranslate">    update1: ((key, val1), time1, diff1)     -- First input
+    update2: ((key, val2), time2, diff2)     -- Second input
+-&gt; 
+    ((key, (val1, val2)),  max(time1, time2),  diff1 * diff2)
+     \-- output data --/   \----  time ----/   \--  diff --/
+</code></pre>
+<p>We can respond to each input update by iterating over the updates in the <em>other</em> input with the same key, and use the rule above.<br>
+There are smarter ways to do this, consider for example the second update introducing and retracting a record before <code class="notranslate">time1</code>: we would produce two outputs that exactly cancel.<br>
+In any case, we'll need to retain <em>some</em> information about each input, ideally arranged by <code class="notranslate">key</code> so that these updates can be efficiently retrieved.</p>
+<p>Differential dataflow has a primitive called an "arrangement", which is both a stream of updates and a maintained indexed form of their accumulation.<br>
+An arrangement translates a stream of updates into a sequence of indexed "batches" of updates, each of which are indexed by <code class="notranslate">key</code>.<br>
+It also maintains a collection of these batches that serve as an indexed roll-up of the accumulated updates, using a structure analogous to a <a href="https://en.wikipedia.org/wiki/Log-structured_merge-tree" rel="nofollow">log-structured merge-tree</a>.<br>
+Arrangements are the primary mechanism to maintain "state" as a dataflow runs, and specifically are what <code class="notranslate">join</code> uses: each input to <code class="notranslate">join</code> must be an arrangement, and if they are not then they will be arranged for you.</p>
+<h3>Technique 1: Shared Arrangements</h3>
+<p>A key advantage to using arrangements is that they can be <a href="http://www.vldb.org/pvldb/vol13/p1793-mcsherry.pdf" rel="nofollow"><em>shared</em></a>.<br>
+Arranged data can be used by any number of dataflows, avoiding the cost of an additional redundant arrangement.<br>
+As an example, imagine we have a collection of link data <code class="notranslate">(source, target)</code>, and we would like to compute and maintain those identifiers within three steps of some query set <code class="notranslate">query</code>.<br>
+If the data are arranged, say in an arrangement named <code class="notranslate">links</code>, we could write</p>
+<div class="highlight highlight-source-rust"><pre class="notranslate"><span class="pl-c">// Join `query` against `links` three times, giving</span>
+<span class="pl-c">// the identifiers three steps away from each query.</span>
+query<span class="pl-kos">.</span><span class="pl-en">map</span><span class="pl-kos">(</span>|query| <span class="pl-kos">(</span>query<span class="pl-kos">,</span> query<span class="pl-kos">)</span><span class="pl-kos">)</span>
+     <span class="pl-kos">.</span><span class="pl-en">join</span><span class="pl-kos">(</span>links<span class="pl-kos">)</span><span class="pl-kos">.</span><span class="pl-en">map</span><span class="pl-kos">(</span>|<span class="pl-kos">(</span>step0<span class="pl-kos">,</span> <span class="pl-kos">(</span>query<span class="pl-kos">,</span> step1<span class="pl-kos">)</span><span class="pl-kos">)</span>| <span class="pl-kos">(</span>step1<span class="pl-kos">,</span> query<span class="pl-kos">)</span><span class="pl-kos">)</span>
+     <span class="pl-kos">.</span><span class="pl-en">join</span><span class="pl-kos">(</span>links<span class="pl-kos">)</span><span class="pl-kos">.</span><span class="pl-en">map</span><span class="pl-kos">(</span>|<span class="pl-kos">(</span>step1<span class="pl-kos">,</span> <span class="pl-kos">(</span>query<span class="pl-kos">,</span> step2<span class="pl-kos">)</span><span class="pl-kos">)</span>| <span class="pl-kos">(</span>step2<span class="pl-kos">,</span> query<span class="pl-kos">)</span><span class="pl-kos">)</span>
+     <span class="pl-kos">.</span><span class="pl-en">join</span><span class="pl-kos">(</span>links<span class="pl-kos">)</span><span class="pl-kos">.</span><span class="pl-en">map</span><span class="pl-kos">(</span>|<span class="pl-kos">(</span>step2<span class="pl-kos">,</span> <span class="pl-kos">(</span>query<span class="pl-kos">,</span> step3<span class="pl-kos">)</span><span class="pl-kos">)</span>| <span class="pl-kos">(</span>step3<span class="pl-kos">,</span> query<span class="pl-kos">)</span><span class="pl-kos">)</span><span class="pl-kos"></span></pre></div>
+<p>This fragment would naively require six arrangements, two for each <code class="notranslate">join</code> invocation.<br>
+However, we are able to re-use the <code class="notranslate">links</code> arrangement at no cost, and instead only introduce three arrangements, corresponding to the number of steps (0, 1, and 2) out from <code class="notranslate">query</code>.<br>
+These new arrangements can be substantially smaller than <code class="notranslate">links</code>, and the amount of work required to compute and maintain the results can be trivial even when <code class="notranslate">links</code> is enormous.</p>
+<h3>Technique 2: Functional Joins</h3>
+<p>This one is a bit of cheat, in that by the end of it you may not be sure it is even a join.</p>
+<p>There are times, and we will see them coming up, where we want to join not against <em>data</em> but against a <em>function</em>.<br>
+For example, perhaps we have a collection of <code class="notranslate">(line, text)</code> of pairs of integers and strings, and we would like to split each <code class="notranslate">text</code> into the words it contains.<br>
+One way to do this is with <code class="notranslate">join</code>: the first input is our lines of text, and the second input is the quite large collection of pairs <code class="notranslate">(text, (pos, word))</code> each indicating a word that can be found in <code class="notranslate">text</code>.</p>
+<p>Rather than hope to implement this with <code class="notranslate">join</code>, because we couldn't hope to maintain the second collection, we could implement this with the <code class="notranslate">flat_map</code> operator instead.</p>
+<div class="highlight highlight-source-rust"><pre class="notranslate"><span class="pl-c">// Convert each `text` into the words it contains.</span>
+lines<span class="pl-kos">.</span><span class="pl-en">flat_map</span><span class="pl-kos">(</span>|<span class="pl-kos">(</span>line<span class="pl-kos">,</span> text<span class="pl-kos">)</span>| 
+    text<span class="pl-kos">.</span><span class="pl-en">split_whitespace</span><span class="pl-kos">(</span><span class="pl-kos">)</span>
+        <span class="pl-kos">.</span><span class="pl-en">enumerate</span><span class="pl-kos">(</span><span class="pl-kos">)</span>
+        <span class="pl-kos">.</span><span class="pl-en">map</span><span class="pl-kos">(</span>|<span class="pl-kos">(</span>pos<span class="pl-kos">,</span> word<span class="pl-kos">)</span>| <span class="pl-kos">(</span>line<span class="pl-kos">,</span> text<span class="pl-kos">.</span><span class="pl-en">clone</span><span class="pl-kos">(</span><span class="pl-kos">)</span><span class="pl-kos">,</span> <span class="pl-kos">(</span>pos<span class="pl-kos">,</span> word<span class="pl-kos">.</span><span class="pl-en">to_owned</span><span class="pl-kos">(</span><span class="pl-kos">)</span><span class="pl-kos">)</span><span class="pl-kos">)</span><span class="pl-kos">)</span>
+<span class="pl-kos">)</span><span class="pl-kos"></span></pre></div>
+<p>At this point you may be wondering why we have called this a "functional join" rather than a "flat map".<br>
+You are not wrong that <code class="notranslate">flat_map</code> is the best way to implement this.<br>
+However, we will need to prepare ourselves to see this pattern in joins, and understand that it is one way to implement something that may present as a <code class="notranslate">join</code>.<br>
+Each input record results in zero or many output records, determined by some key fields in the record.</p>
+<h3>Technique 3: Multi-way Joins</h3>
+<p>Even managing a single join can be challenging, but invariably folks actually want to perform multiple joins at once.<br>
+Recall our <code class="notranslate">query</code> and <code class="notranslate">links</code> example, from just up above</p>
+<div class="highlight highlight-source-rust"><pre class="notranslate"><span class="pl-c">// Join `query` against `links` three times, giving</span>
+<span class="pl-c">// the identifiers three steps away from each query.</span>
+query<span class="pl-kos">.</span><span class="pl-en">map</span><span class="pl-kos">(</span>|query| <span class="pl-kos">(</span>query<span class="pl-kos">,</span> query<span class="pl-kos">)</span><span class="pl-kos">)</span>
+     <span class="pl-kos">.</span><span class="pl-en">join</span><span class="pl-kos">(</span>links<span class="pl-kos">)</span><span class="pl-kos">.</span><span class="pl-en">map</span><span class="pl-kos">(</span>|<span class="pl-kos">(</span>step0<span class="pl-kos">,</span> <span class="pl-kos">(</span>query<span class="pl-kos">,</span> step1<span class="pl-kos">)</span><span class="pl-kos">)</span>| <span class="pl-kos">(</span>step1<span class="pl-kos">,</span> query<span class="pl-kos">)</span><span class="pl-kos">)</span>
+     <span class="pl-kos">.</span><span class="pl-en">join</span><span class="pl-kos">(</span>links<span class="pl-kos">)</span><span class="pl-kos">.</span><span class="pl-en">map</span><span class="pl-kos">(</span>|<span class="pl-kos">(</span>step1<span class="pl-kos">,</span> <span class="pl-kos">(</span>query<span class="pl-kos">,</span> step2<span class="pl-kos">)</span><span class="pl-kos">)</span>| <span class="pl-kos">(</span>step2<span class="pl-kos">,</span> query<span class="pl-kos">)</span><span class="pl-kos">)</span>
+     <span class="pl-kos">.</span><span class="pl-en">join</span><span class="pl-kos">(</span>links<span class="pl-kos">)</span><span class="pl-kos">.</span><span class="pl-en">map</span><span class="pl-kos">(</span>|<span class="pl-kos">(</span>step2<span class="pl-kos">,</span> <span class="pl-kos">(</span>query<span class="pl-kos">,</span> step3<span class="pl-kos">)</span><span class="pl-kos">)</span>| <span class="pl-kos">(</span>step3<span class="pl-kos">,</span> query<span class="pl-kos">)</span><span class="pl-kos">)</span><span class="pl-kos"></span></pre></div>
+<p>This performs three joins, and introduces new arrangements for the left inputs of each of the three <code class="notranslate">join</code> calls.<br>
+We argued that this could be small if <code class="notranslate">query</code> is small, and also if each of the intermediate results are small.<br>
+But if this isn't the case, then they might be large, and we might end up maintaining quite a lot of information.</p>
+<p>Let's take a different example that might not be so easy.<br>
+Imagine you start with a collection <code class="notranslate">facts</code> of raw data, and you want to enrich it using dimesion tables that translate foreign keys like "user id" into further detail.<br>
+The additional detail may result in further keys you want to unpack, like addresses, zipcodes, and the sales agents they map to.</p>
+<div class="highlight highlight-source-rust"><pre class="notranslate"><span class="pl-c">// Enrich facts with user, address, and sales agent information.</span>
+facts<span class="pl-kos">.</span><span class="pl-en">map</span><span class="pl-kos">(</span>|fact| <span class="pl-kos">(</span>fact<span class="pl-kos">.</span><span class="pl-c1">user_id</span><span class="pl-kos">,</span> fact<span class="pl-kos">)</span><span class="pl-kos">)</span><span class="pl-kos">.</span><span class="pl-en">join</span><span class="pl-kos">(</span>users<span class="pl-kos">)</span><span class="pl-kos">.</span><span class="pl-en">map</span><span class="pl-kos">(</span> .. <span class="pl-kos">)</span>
+     <span class="pl-kos">.</span><span class="pl-en">map</span><span class="pl-kos">(</span>|fact| <span class="pl-kos">(</span>fact<span class="pl-kos">.</span><span class="pl-c1">addr_id</span><span class="pl-kos">,</span> fact<span class="pl-kos">)</span><span class="pl-kos">)</span><span class="pl-kos">.</span><span class="pl-en">join</span><span class="pl-kos">(</span>addrs<span class="pl-kos">)</span><span class="pl-kos">.</span><span class="pl-en">map</span><span class="pl-kos">(</span> .. <span class="pl-kos">)</span>
+     <span class="pl-kos">.</span><span class="pl-en">map</span><span class="pl-kos">(</span>|fact| <span class="pl-kos">(</span>fact<span class="pl-kos">.</span><span class="pl-c1">zipcode</span><span class="pl-kos">,</span> fact<span class="pl-kos">)</span><span class="pl-kos">)</span><span class="pl-kos">.</span><span class="pl-en">join</span><span class="pl-kos">(</span>agent<span class="pl-kos">)</span><span class="pl-kos">.</span><span class="pl-en">map</span><span class="pl-kos">(</span> .. <span class="pl-kos">)</span><span class="pl-kos"></span></pre></div>
+<p>Lots and lots of data pipelines have this sort of enrichment in them, in part because "normalized" database best practices are to factor apart this information.<br>
+Unfortunately, stitching it back together efficiently is an important part of these best practices.</p>
+<p>For this query, we may have arrangements of <code class="notranslate">users</code>, <code class="notranslate">addrs</code>, <code class="notranslate">agent</code>.<br>
+However, we are unlikely to have arrangements of the left inputs to each of the <code class="notranslate">join</code>s.<br>
+The very first left input, <code class="notranslate">facts</code> keyed by <code class="notranslate">user_id</code>, is plausibly something we might have pre-arranged, but the other two result from the query itself.<br>
+Naively implemented, we'll create second and third arrangements of enriched <code class="notranslate">fact</code> data, which can be really quite large.</p>
+<p>Fortunately, there is a trick for multiway joins that I have no better name for than <a href="https://github.com/TimelyDataflow/differential-dataflow/tree/master/dogsdogsdogs">"delta joins"</a>.<br>
+The gist is that rather than plan a multiway join as a sequence (or tree) of binary joins, as done in System R, you describe how the whole join will vary as a function of each input.<br>
+You can get this derivation by expanding out our derivation for binary joins, in terms of input updates, to multiple inputs.<br>
+You then independently implement each of these response functions for each input as best as you can and then compose their results.</p>
+<p>For example, our query above joins four relations: <code class="notranslate">facts</code>, <code class="notranslate">users</code>, <code class="notranslate">addrs</code>, and <code class="notranslate">agent</code>, subject to some equality constraints.<br>
+When <code class="notranslate">facts</code> changes, we need to look up enrichments in <code class="notranslate">users</code>, then <code class="notranslate">addrs</code>, then <code class="notranslate">agent</code> to find the change to enriched facts.<br>
+When <code class="notranslate">agent</code> changes, we need to find the affected <code class="notranslate">addrs</code>, then <code class="notranslate">users</code>, then <code class="notranslate">facts</code>, in order to update the enrichment of existing facts.</p>
+<pre class="notranslate"><code class="notranslate">-- rules for how to react to an update to each input.
+-- elided: equality constraints for each join (⋈).
+d_query/d_facts = d_facts ⋈ users ⋈ addrs ⋈ agent
+d_query/d_users = d_users ⋈ addrs ⋈ agent ⋈ facts
+d_query/d_addrs = d_addrs ⋈ agent ⋈ users ⋈ facts
+d_query/d_agent = d_agent ⋈ addrs ⋈ users ⋈ facts
+</code></pre>
+<p>The overall changes to <code class="notranslate">query</code> result from adding together these update rules.</p>
+<p>What's different above is that each of the <code class="notranslate">d_term ⋈</code> joins are <em>ephemeral</em>: no one needs to remember the <code class="notranslate">d_</code> part of the input.<br>
+Each of these rules are implementable with what differential dataflow calls a <code class="notranslate">half_join</code>: an operator that responds to records in one input by look-ups into a second, and which does not respond to changes to the second input.<br>
+The <code class="notranslate">half_join</code> operator needs an arrangement of its second input, but not of its first input.</p>
+<p>This pattern has different arrangement requirements than the sequence of binary <code class="notranslate">join</code> operators.<br>
+Each collection needs an arrangement by those attributes by which it may be interrogated.<br>
+In the example above, the required arrangements end up being:</p>
+<ol>
+<li>input <code class="notranslate">facts</code> arranged by <code class="notranslate">user_id</code>,</li>
+<li>input <code class="notranslate">users</code> arranged by <code class="notranslate">user_id</code> and also by <code class="notranslate">addr_id</code>,</li>
+<li>input <code class="notranslate">addrs</code> arranged by <code class="notranslate">addr_id</code> and also by <code class="notranslate">zipcode</code>,</li>
+<li>input <code class="notranslate">agent</code> arranged by <code class="notranslate">zipcode</code>.</li>
+</ol>
+<p>This ends up being six arrangements, just like before, but they are all arrangements we might reasonably have ahead of time.<br>
+The <em>incremental</em> arrangement cost of the query can be zero, if these arrangement are all pre-built.</p>
+<h3>Boss Battle: Left Outer Joins</h3>
+<p>An "outer" join is a SQL construct that is much like an standard ("inner") join except that any records that "miss", i.e. do not match any other records, are still produced as output but with <code class="notranslate">NULL</code> values in columns we hoped to populate.<br>
+Outer joins are helpful in best-effort joins, where you hope to enrich some data, but can't be certain you'll find the enrichment and don't want to lose the input data if you cannot.</p>
+<p>For example, consider our <code class="notranslate">facts</code>, <code class="notranslate">users</code>, <code class="notranslate">addrs</code>, and <code class="notranslate">agent</code> scenario just above.<br>
+What would happen if there is a <code class="notranslate">user_id</code> that does not exist in <code class="notranslate">users</code>, or a <code class="notranslate">addr_id</code> that does not exist in <code class="notranslate">addrs</code>, or a <code class="notranslate">zipcode</code> that does not exist in <code class="notranslate">agent</code>?<br>
+Written as a conventional join, we would simply drop such records on the floor and never speak of them.<br>
+Sometimes that is the right thing to do, but often you want to see the data along with any <em>failures</em> to find the enrichments.</p>
+<p>If we take our example from above but use <code class="notranslate">LEFT JOIN</code> instead of <code class="notranslate">join</code>, we will keep even facts that do not match <code class="notranslate">users</code>, <code class="notranslate">addrs</code>, or <code class="notranslate">agent</code>.</p>
+<div class="highlight highlight-source-sql"><pre class="notranslate"><span class="pl-c"><span class="pl-c">--</span> Enrich facts with more data, but don't lose any.</span>
+facts <span class="pl-k">LEFT JOIN</span> users <span class="pl-k">ON</span> (<span class="pl-c1">facts</span>.<span class="pl-c1">user_id</span> <span class="pl-k">=</span> <span class="pl-c1">users</span>.<span class="pl-c1">id</span>)
+      <span class="pl-k">LEFT JOIN</span> addrs <span class="pl-k">ON</span> (<span class="pl-c1">users</span>.<span class="pl-c1">addr_id</span> <span class="pl-k">=</span> <span class="pl-c1">addrs</span>.<span class="pl-c1">id</span>)
+      <span class="pl-k">LEFT JOIN</span> agent <span class="pl-k">ON</span> (<span class="pl-c1">addrs</span>.<span class="pl-c1">zipcode</span> <span class="pl-k">=</span> <span class="pl-c1">agent</span>.<span class="pl-c1">zc</span>)</pre></div>
+<p>There are also <code class="notranslate">RIGHT</code> and <code class="notranslate">FULL</code> joins, which respectively go in the other direction (e.g. output users that match no facts, with null fact columns) and in both directions (all bonus records that would be added to a <code class="notranslate">LEFT</code> or <code class="notranslate">RIGHT</code> join).<br>
+We are only going to noodle on <code class="notranslate">LEFT</code> joins, though the noodling should generalize just fine.</p>
+<p>To implement left joins, we'll need to find a way to express them in terms of the tools we have.<br>
+Those tools are .. the operators differential dataflow provides; things like <code class="notranslate">map</code>, <code class="notranslate">filter</code>, <code class="notranslate">join</code>, and <code class="notranslate">reduce</code> (no <code class="notranslate">iterate</code>. NO!).</p>
+<h3>Step one: turn LEFT JOINs into JOINs</h3>
+<p>When we left join two collections, some records match perfectly as in an inner join, and some do not.<br>
+What do we have to add to the results of the inner join to get the correct answer?<br>
+Specifically, any keys that might be present in the first input, but are not present in the second input, could just be added to the second input with <code class="notranslate">NULL</code> values.</p>
+<div class="highlight highlight-source-sql"><pre class="notranslate"><span class="pl-c"><span class="pl-c">--</span> Some facts exactly match some entry in users.</span>
+<span class="pl-k">SELECT</span> <span class="pl-k">*</span> <span class="pl-k">FROM</span> facts <span class="pl-k">INNER JOIN</span> users <span class="pl-k">ON</span> (<span class="pl-c1">facts</span>.<span class="pl-c1">user_id</span> <span class="pl-k">=</span> <span class="pl-c1">users</span>.<span class="pl-c1">id</span>)
+<span class="pl-c"><span class="pl-c">--</span> Some facts totally miss, but need to match something.</span>
+<span class="pl-k">UNION ALL</span>
+<span class="pl-k">SELECT</span> facts.<span class="pl-k">*</span>, <span class="pl-k">NULL</span> <span class="pl-k">FROM</span> facts
+<span class="pl-k">WHERE</span> <span class="pl-c1">facts</span>.<span class="pl-c1">user_id</span> NOT <span class="pl-k">IN</span> (<span class="pl-k">SELECT</span> id <span class="pl-k">FROM</span> users)</pre></div>
+<p>This construction keeps the <code class="notranslate">INNER JOIN</code> pristine, but adds in <code class="notranslate">facts</code> extended by <code class="notranslate">NULL</code>s for any fact whose <code class="notranslate">user_id</code> is not found in <code class="notranslate">users</code>.<br>
+Although not totally clear, <code class="notranslate">NOT IN</code> results in a join between <code class="notranslate">facts</code> and distinct <code class="notranslate">users.id</code>.<br>
+This approach feels good, re-uses arrangements on <code class="notranslate">facts</code> and <code class="notranslate">users</code>, and is pretty close to what Materialize does for you at the moment.</p>
+<p>However, this technique is not great for multiway outer joins.<br>
+We need access to the left input (here: <code class="notranslate">facts</code>) to complete the outer join, and generally that input is the result of the outer join just before this one.<br>
+If we need to have that answer to form this query fragment, we don't have a story for how they all become one multiway inner join.<br>
+Likewise, Materialize currently plans a multiway outer join as a <em>sequence</em> of fragments like above that <em>involve</em> inner joins, but are not <em>an</em> inner join.</p>
+<h3>Step two: Multiway LEFT JOINS into Multiway JOINs</h3>
+<p>Let's take the intuition above and see if we can preserve the join structure.<br>
+We want to produce a SQL fragment that is at its root just an inner join.<br>
+We will need to be careful that it should rely on base tables, not its direct inputs (what?).</p>
+<p>Let's start and we'll see where we get.</p>
+<p>First, let's rewrite the above fragment in a way that looks more like <em>one</em> inner join.<br>
+One one side we have <code class="notranslate">facts</code>, and on the other side .. at least <code class="notranslate">users</code> but also some other stuff?<br>
+For a first cut, that "other stuff" is .. the <code class="notranslate">user_id</code>s in <code class="notranslate">facts</code> but not in <code class="notranslate">users</code>?<br>
+We could add those rows to <code class="notranslate">users</code>, with <code class="notranslate">NULL</code> values in missing columns, and see what we get!</p>
+<p>As it turns out we get totally the wrong answer.<br>
+Best intentions, of course, but the wrong answer.<br>
+I believe the right answer is expressed roughly this way, in SQL:</p>
+<div class="highlight highlight-source-sql"><pre class="notranslate"><span class="pl-c"><span class="pl-c">--</span> Some facts exactly match some entry in users.</span>
+<span class="pl-k">SELECT</span> facts.<span class="pl-k">*</span>, users.<span class="pl-k">*</span> 
+<span class="pl-k">FROM</span> facts <span class="pl-k">INNER JOIN</span> users <span class="pl-k">ON</span> (<span class="pl-c1">facts</span>.<span class="pl-c1">user_id</span> <span class="pl-k">=</span> <span class="pl-c1">users</span>.<span class="pl-c1">id</span>)
+<span class="pl-c"><span class="pl-c">--</span> Some facts totally miss, but could match something.</span>
+<span class="pl-k">UNION ALL</span>
+WITH absent(id) <span class="pl-k">AS</span> (
+    <span class="pl-k">SELECT</span> user_id <span class="pl-k">FROM</span> facts 
+    EXCEPT 
+    <span class="pl-k">SELECT</span> id <span class="pl-k">FROM</span> users
+)
+<span class="pl-k">SELECT</span> facts.<span class="pl-k">*</span>, <span class="pl-k">NULL</span> 
+<span class="pl-k">FROM</span> facts <span class="pl-k">INNER JOIN</span> absent <span class="pl-k">ON</span> (<span class="pl-c1">facts</span>.<span class="pl-c1">user_id</span> <span class="pl-k">=</span> <span class="pl-c1">absent</span>.<span class="pl-c1">id</span>)
+<span class="pl-c"><span class="pl-c">--</span> Some facts have NULL `user_id` and refuse to be joined.</span>
+<span class="pl-k">UNION ALL</span>
+<span class="pl-k">SELECT</span> facts.<span class="pl-k">*</span>, <span class="pl-k">NULL</span>
+<span class="pl-k">FROM</span> facts <span class="pl-k">WHERE</span> <span class="pl-c1">facts</span>.<span class="pl-c1">user_id</span> IS <span class="pl-k">NULL</span></pre></div>
+<p>We do grab the <code class="notranslate">absent</code> keys, but importantly we produce <code class="notranslate">NULL</code> in their key columns.<br>
+We also need to deal with potentially null <code class="notranslate">user_id</code> values, which we do in the third clause, because SQL's <code class="notranslate">NULL</code> values do not equal themselves.<br>
+Again, best intentions, I'm sure.</p>
+<p>The good news is that we have framed the SQL in a way that looks like (taking some notational liberties):</p>
+<pre class="notranslate"><code class="notranslate">  facts ⋈ users
++ facts ⋈ absent    -- with null outputs
++ facts ⋈ NULLs     -- only for null user_id
+</code></pre>
+<p>Each of the three joins are slightly different, but they all have the property that <code class="notranslate">facts</code> arranged by <code class="notranslate">user_id</code> is enough for them.<br>
+We can and will now factor out <code class="notranslate">facts</code> from these three terms, which puts us in a position to write our multiway left join as:</p>
+<pre class="notranslate"><code class="notranslate">-- Left join of facts, users, addrs, and agent.
+facts ⋈ (users + absent(users) + NULL)
+      ⋈ (addrs + absent(addrs) + NULL)
+      ⋈ (agent + absent(agent) + NULL)
+</code></pre>
+<p>This is starting to look a bit more like the joins over sums of terms advertised in the beginning of the post.<br>
+For the moment, we are just going to add together the terms, though.</p>
+<p>There is quite a lot unsaid here, and the nature of the ⋈ varies a bit for each of the terms in parentheses.<br>
+You do have to populate the <code class="notranslate">absent(foo)</code> collections with values from base relations, rather than their immediate inputs.<br>
+And fortunately, SQL notwithstanding, differential dataflow <em>does</em> equate NULL with itself, and everything works out just fine.<br>
+Materialize <a href="https://github.com/MaterializeInc/materialize/pull/24345" data-hovercard-type="pull_request" data-hovercard-url="/MaterializeInc/materialize/pull/24345/hovercard">recently merged</a> an approach that looks like this for multiway outer joins.<br>
+It's early days, but we'll soon start exploring how this work for folks with stacks of left joins.</p>
+<p>But the story doesn't end here.<br>
+Somewhat stressfully, this approach takes existing inputs <code class="notranslate">facts</code>, <code class="notranslate">users</code>, <code class="notranslate">addrs</code>, and <code class="notranslate">agent</code> and .. fails to use any of their pre-existing arrangements.<br>
+It has some other performance issues as well.</p>
+<h3>Step three: Rendering JOINs of UNIONs</h3>
+<p>The last step, or next step at least .. perhaps not the last, is to render these query plans efficiently.<br>
+At the moment we have no better plan than to treat the augmented collections as new collections, arrange them, and join them.<br>
+Roughly like so:</p>
+<pre class="notranslate"><code class="notranslate">-- Left join of facts, users, addrs, and agent.
+with users_aug as (users + absent(users) + NULL)
+with addrs_aug as (addrs + absent(users) + NULL)
+with agent_aug as (agent + absent(agent) + NULL)
+facts ⋈ users_aug ⋈ addrs_aug ⋈ agent_aug
+</code></pre>
+<p>These <code class="notranslate">_aug</code> collections are as big (somewhat bigger) than their unaugmented counterparts, and it feels somewhat bad to re-arrange them.<br>
+It feels bad that despite pre-arranging <code class="notranslate">users</code>, <code class="notranslate">addrs</code>, and <code class="notranslate">agent</code> we can re-use none of them.<br>
+It feels bad that all <code class="notranslate">NULL</code> values will be routed to a single worker just to find out that they map to <code class="notranslate">NULL</code>; lots of work for no surprise.</p>
+<p>However, we can get around all of these bad feels with some dataflow shenanigans.<br>
+Unfortunately, they are shenanigans that as far as I can tell neither Materialize nor SQL can describe.</p>
+<p>We have two strategies for evaluating multiway joins: as a sequence of binary joins, and using delta join rules.<br>
+The shenanigans are easier with the sequence of binary joins, so let's start there.<br>
+We are going to do something as simple as re-distributing over the <code class="notranslate">⋈</code> operator, performing each join the way we want.<br>
+We then add up the results of each step of the join rather than adding up the inputs to each step of the join.</p>
+<pre class="notranslate"><code class="notranslate">-- Left join of facts, users, addrs, and agent.
+step0 = facts;
+step1 = step0 ⋈ users + step0 ⋈ absent(users) + step0 ⋈ NULL;
+step2 = step1 ⋈ addrs + step1 ⋈ absent(addrs) + step1 ⋈ NULL;
+step3 = step2 ⋈ agent + step2 ⋈ absent(agent) + step2 ⋈ NULL;
+step3
+</code></pre>
+<p>Each of these ⋈ operators are slightly different.<br>
+The first ⋈ in each row is the traditional equijoin.<br>
+The second ⋈ in each row is an equijoin that projects away matched keys and puts <code class="notranslate">NULL</code> in their place.<br>
+The third ⋈ in each row only matches nulls.</p>
+<p>However, in each line we only have to arrange non-null <code class="notranslate">stepx</code> and determine and arrange <code class="notranslate">absent(foo)</code>.<br>
+We can re-use existing arrangements of <code class="notranslate">users</code>, <code class="notranslate">addrs</code>, and <code class="notranslate">agent</code>.<br>
+The join with <code class="notranslate">NULL</code> can be implemented as a <code class="notranslate">flat_map</code> rather than by co-locating all null records for a <code class="notranslate">join</code> (omg finally explained).</p>
+<p>In actual fact, we can implement this in both SQL and Materialize, but in doing so we'll lose the multiway join planning benefit of avoiding intermediate arrangements.<br>
+We will need to arrange <code class="notranslate">stepx</code> for each <code class="notranslate">x</code>, and the nice folks with stack of left joins 30+ deep (yes, seriously) will be sitting on 30x as much data as they feel they should.</p>
+<p>To recover the benefits, let's grab the delta join construction from way up above.<br>
+I'll use <code class="notranslate">_aug</code> suffixes to remind us that it isn't going to be as easy as joining against the pre-arranged collections.</p>
+<pre class="notranslate"><code class="notranslate">-- rules for how to react to an update to each input.
+-- elided: equality constraints for each join (⋈).
+d_query/d_facts     = d_facts     ⋈ users_aug ⋈ addrs_aug ⋈ agent_aug
+d_query/d_users_aug = d_users_aug ⋈ addrs_aug ⋈ agent_aug ⋈ facts
+d_query/d_addrs_aug = d_addrs_aug ⋈ agent_aug ⋈ users_aug ⋈ facts
+d_query/d_agent_aug = d_agent_aug ⋈ addrs_aug ⋈ users_aug ⋈ facts
+</code></pre>
+<p>Ignore for the moment the fact that <code class="notranslate">d_users_aug</code> is complicated (an update to <code class="notranslate">users</code> may induce the opposite update to <code class="notranslate">absent(users)</code>).<br>
+Each line up above describes a sequence of <code class="notranslate">half_join</code> applications, which like <code class="notranslate">join</code> also distributes over <code class="notranslate">+</code>.</p>
+<pre class="notranslate"><code class="notranslate">  d_query/d_facts    
+= d_facts ⋈ users_aug ⋈ addrs_aug ⋈ agent_aug
+= ( 
+    d_step0 = d_facts;
+    d_step1 = d_step0 ⋈ users + d_step0 ⋈ absent(users) + d_step0 ⋈ NULL;
+    d_step2 = d_step1 ⋈ addrs + d_step1 ⋈ absent(addrs) + d_step1 ⋈ NULL;
+    d_step3 = d_step2 ⋈ agent + d_step2 ⋈ absent(agent) + d_step2 ⋈ NULL;
+    d_step3
+)
+</code></pre>
+<p>Each time we need to do a <code class="notranslate">half_join</code>, we can unpack the right argument to it and conduct the half join as we see fit.<br>
+We can either <code class="notranslate">half_join</code> with a pre-existing arrangement, <code class="notranslate">half_join</code> with a new arrangement of absent values, or <code class="notranslate">flat_map</code> some <code class="notranslate">NULL</code> values into place.</p>
+<p>Writing the whole thing out is exhausting, especially for 30-deep stacks of left joins.<br>
+Fortunately this is something computers are good at.<br>
+Much like it now seems that they may be good at computing and maintaining deep stacks of left equijoins.</p>
+<h3>What's next?</h3>
+<p>There is an expressivity gap to close between SQL/Materialize and differential dataflow.<br>
+I'm not aware of a SQL-to-SQL rewrite that gets us the desired implementation, because we cannot afford to distribute the joins out across the unions, and SQL does not have a <code class="notranslate">half_join</code> operator.<br>
+We're pondering options now, including expanding our lowest level IR to reflect e.g. half joins, and tweaking the renderer to recognize the idiom of joins between sums of terms.<br>
+There will certainly be some amount of measurement as we try and assess the remaining gap, and draw down the amount of time and resources spent on outer joins.</p>
+<p>I have a concurrent effort to spread the gospel of <a href="https://en.wikipedia.org/wiki/Referential_integrity" rel="nofollow">referential integrity</a> so that we can turn those outer joins to inner joins.<br>
+You can understand how in weakly consistent systems you'd need the outer joins to cover for inconsistencies, but do you need it in a strongly consistent system like Materialize?</p>
+<p>Of course, if you've read this far you have an obligation to fill me in on what I've missed about all of this.<br>
+Is there an easier transform, one that doesn't end up joining terms that are themselves sums of useful constituents?<br>
+Do you have an exciting use case for maintaining stacks of outer joins, and you've been burned before?<br>
+Do reach out in these cases, and <a href="https://materialize.com/register/" rel="nofollow">take Materialize for a spin</a> (though, if you have stacks of 30+ left joins, please reach out for some personal attention).</p></div>
+<div style="font-size:small;margin-top:8px;float:right;"></div>
+
+<button class="btn btn-block" type="button" onclick="openComments()" id="cmButton">评论</button>
+<div class="comments" id="comments"></div>
+
+</div>
+    <div id="footer"><div id="footer1">Copyright © <span id="copyrightYear"></span> <a href="https://nuowoo.github.io/blog">Blog Title</a></div>
+<div id="footer2">
+    <span id="runday"></span><span>Powered by <a href="https://meekdai.com/Gmeek.html" target="_blank">Gmeek</a></span>
+</div>
+
+<script>
+var now=new Date();
+document.getElementById("copyrightYear").innerHTML=now.getFullYear();
+
+if(""!=""){
+    var startSite=new Date("");
+    var diff=now.getTime()-startSite.getTime();
+    var diffDay=Math.floor(diff/(1000*60*60*24));
+    document.getElementById("runday").innerHTML="网站运行"+diffDay+"天"+" • ";
+}
+</script></div>
+</body>
+<script>
+var IconList={'sun': 'M8 10.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5zM8 12a4 4 0 100-8 4 4 0 000 8zM8 0a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0V.75A.75.75 0 018 0zm0 13a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0v-1.5A.75.75 0 018 13zM2.343 2.343a.75.75 0 011.061 0l1.06 1.061a.75.75 0 01-1.06 1.06l-1.06-1.06a.75.75 0 010-1.06zm9.193 9.193a.75.75 0 011.06 0l1.061 1.06a.75.75 0 01-1.06 1.061l-1.061-1.06a.75.75 0 010-1.061zM16 8a.75.75 0 01-.75.75h-1.5a.75.75 0 010-1.5h1.5A.75.75 0 0116 8zM3 8a.75.75 0 01-.75.75H.75a.75.75 0 010-1.5h1.5A.75.75 0 013 8zm10.657-5.657a.75.75 0 010 1.061l-1.061 1.06a.75.75 0 11-1.06-1.06l1.06-1.06a.75.75 0 011.06 0zm-9.193 9.193a.75.75 0 010 1.06l-1.06 1.061a.75.75 0 11-1.061-1.06l1.06-1.061a.75.75 0 011.061 0z', 'moon': 'M9.598 1.591a.75.75 0 01.785-.175 7 7 0 11-8.967 8.967.75.75 0 01.961-.96 5.5 5.5 0 007.046-7.046.75.75 0 01.175-.786zm1.616 1.945a7 7 0 01-7.678 7.678 5.5 5.5 0 107.678-7.678z', 'sync': 'M1.705 8.005a.75.75 0 0 1 .834.656 5.5 5.5 0 0 0 9.592 2.97l-1.204-1.204a.25.25 0 0 1 .177-.427h3.646a.25.25 0 0 1 .25.25v3.646a.25.25 0 0 1-.427.177l-1.38-1.38A7.002 7.002 0 0 1 1.05 8.84a.75.75 0 0 1 .656-.834ZM8 2.5a5.487 5.487 0 0 0-4.131 1.869l1.204 1.204A.25.25 0 0 1 4.896 6H1.25A.25.25 0 0 1 1 5.75V2.104a.25.25 0 0 1 .427-.177l1.38 1.38A7.002 7.002 0 0 1 14.95 7.16a.75.75 0 0 1-1.49.178A5.5 5.5 0 0 0 8 2.5Z', 'home': 'M6.906.664a1.749 1.749 0 0 1 2.187 0l5.25 4.2c.415.332.657.835.657 1.367v7.019A1.75 1.75 0 0 1 13.25 15h-3.5a.75.75 0 0 1-.75-.75V9H7v5.25a.75.75 0 0 1-.75.75h-3.5A1.75 1.75 0 0 1 1 13.25V6.23c0-.531.242-1.034.657-1.366l5.25-4.2Zm1.25 1.171a.25.25 0 0 0-.312 0l-5.25 4.2a.25.25 0 0 0-.094.196v7.019c0 .138.112.25.25.25H5.5V8.25a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 .75.75v5.25h2.75a.25.25 0 0 0 .25-.25V6.23a.25.25 0 0 0-.094-.195Z', 'github': 'M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z', 'copy': 'M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z', 'check': 'M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z'};
+var utterancesLoad=0;
+
+let themeSettings={
+    "dark": ["dark","moon","#00f0ff","dark-blue"],
+    "light": ["light","sun","#ff5000","github-light"],
+    "auto": ["auto","sync","","preferred-color-scheme"]
+};
+function changeTheme(mode, icon, color, utheme){
+    document.documentElement.setAttribute("data-color-mode",mode);
+    document.getElementById("themeSwitch").setAttribute("d",value=IconList[icon]);
+    document.getElementById("themeSwitch").parentNode.style.color=color;
+    if(utterancesLoad==1){utterancesTheme(utheme);}
+}
+function modeSwitch(){
+    let currentMode=document.documentElement.getAttribute('data-color-mode');
+    let newMode = currentMode === "light" ? "dark" : currentMode === "dark" ? "auto" : "light";
+    localStorage.setItem("meek_theme", newMode);
+    if(themeSettings[newMode]){
+        changeTheme(...themeSettings[newMode]);
+    }
+}
+function utterancesTheme(theme){
+    const message={type:'set-theme',theme: theme};
+    const iframe=document.getElementsByClassName('utterances-frame')[0];
+    iframe.contentWindow.postMessage(message,'https://utteranc.es');
+}
+if(themeSettings[theme]){changeTheme(...themeSettings[theme]);}
+console.log("\n %c Gmeek last https://github.com/Meekdai/Gmeek \n","padding:5px 0;background:#02d81d;color:#fff");
+</script>
+
+<script>
+document.getElementById("pathHome").setAttribute("d",IconList["home"]);
+document.getElementById("pathIssue").setAttribute("d",IconList["github"]);
+
+
+
+function openComments(){
+    cm=document.getElementById("comments");
+    cmButton=document.getElementById("cmButton");
+    cmButton.innerHTML="loading";
+    span=document.createElement("span");
+    span.setAttribute("class","AnimatedEllipsis");
+    cmButton.appendChild(span);
+
+    script=document.createElement("script");
+    script.setAttribute("src","https://utteranc.es/client.js");
+    script.setAttribute("repo","nuowoo/blog");
+    script.setAttribute("issue-term","title");
+    
+    if(localStorage.getItem("meek_theme")=="dark"){script.setAttribute("theme","dark-blue");}
+    else if(localStorage.getItem("meek_theme")=="light") {script.setAttribute("theme","github-light");}
+    else{script.setAttribute("theme","preferred-color-scheme");}
+    
+    script.setAttribute("crossorigin","anonymous");
+    script.setAttribute("async","");
+    cm.appendChild(script);
+
+    int=self.setInterval("iFrameLoading()",200);
+}
+
+function iFrameLoading(){
+    var utterances=document.getElementsByClassName('utterances');
+    if(utterances.length==1){
+        if(utterances[0].style.height!=""){
+            utterancesLoad=1;
+            int=window.clearInterval(int);
+            document.getElementById("cmButton").style.display="none";
+            console.log("utterances Load OK");
+        }
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const createClipboardHTML = (codeContent, additionalClasses = '') => `
+        <pre class="notranslate"><code class="notranslate">${codeContent}</code></pre>
+        <div class="clipboard-container position-absolute right-0 top-0 ${additionalClasses}">
+            <clipboard-copy class="ClipboardButton btn m-2 p-0" role="button" style="display: inherit;">
+                <svg height="16" width="16" class="octicon octicon-copy m-2"><path d="${IconList["copy"]}"></path></svg>
+                <svg height="16" width="16" class="octicon octicon-check color-fg-success m-2 d-none"><path d="${IconList["check"]}"></path></svg>
+            </clipboard-copy>
+            <div class="copy-feedback">Copied!</div>
+        </div>
+    `;
+
+    const handleCodeElements = (selector = '') => {
+        document.querySelectorAll(selector).forEach(codeElement => {
+            const codeContent = codeElement.innerHTML;
+            const newStructure = document.createElement('div');
+            newStructure.className = 'snippet-clipboard-content position-relative overflow-auto';
+            newStructure.innerHTML = createClipboardHTML(codeContent);
+
+            const parentElement = codeElement.parentElement;
+            if (selector.includes('highlight')) {
+                parentElement.insertBefore(newStructure, codeElement.nextSibling);
+                parentElement.removeChild(codeElement);
+            } else {
+                parentElement.parentElement.replaceChild(newStructure, parentElement);
+            }
+        });
+    };
+
+    handleCodeElements('pre.notranslate > code.notranslate');
+    handleCodeElements('div.highlight > pre.notranslate');
+
+    let currentFeedback = null;
+    document.querySelectorAll('clipboard-copy').forEach(copyButton => {
+        copyButton.addEventListener('click', () => {
+            const codeContent = copyButton.closest('.snippet-clipboard-content').innerText;
+            const tempTextArea = document.createElement('textarea');
+            tempTextArea.value = codeContent;
+            document.body.appendChild(tempTextArea);
+            tempTextArea.select();
+            document.execCommand('copy');
+            document.body.removeChild(tempTextArea);
+
+            const copyIcon = copyButton.querySelector('.octicon-copy');
+            const checkIcon = copyButton.querySelector('.octicon-check');
+            const copyFeedback = copyButton.nextElementSibling;
+
+            if (currentFeedback && currentFeedback !== copyFeedback) {currentFeedback.style.display = 'none';}
+            currentFeedback = copyFeedback;
+
+            copyIcon.classList.add('d-none');
+            checkIcon.classList.remove('d-none');
+            copyFeedback.style.display = 'block';
+            copyButton.style.borderColor = 'var(--color-success-fg)';
+
+            setTimeout(() => {
+                copyIcon.classList.remove('d-none');
+                checkIcon.classList.add('d-none');
+                copyFeedback.style.display = 'none';
+                copyButton.style.borderColor = '';
+            }, 2000);
+        });
+    });
+});
+
+</script>
+
+
+</html>
