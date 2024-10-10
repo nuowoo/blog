@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html data-color-mode="light" data-dark-theme="dark" data-light-theme="light" lang="zh-CN">
+<head>
+    <meta content="text/html; charset=utf-8" http-equiv="content-type" />
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <link href='https://mirrors.sustech.edu.cn/cdnjs/ajax/libs/Primer/21.0.7/primer.css' rel='stylesheet' />
+    <script src='https://blog.meekdai.com/Gmeek/plugins/GmeekVercount.js'></script>,<script type='text/javascript' src='https://udbaa.com/bnr.php?section=GeneralA&pub=847466&format=728x90&ga=g'></script>
+    <link rel="icon" href="https://github.githubassets.com/favicons/favicon.svg"><script>
+        let theme = localStorage.getItem("meek_theme") || "light";
+        document.documentElement.setAttribute("data-color-mode", theme);
+    </script>
+<meta name="description" content="
+Responsiveness is one of three components of [Materialize's Trust pillar of product value](https://materialize.com/blog/operational-attributes/#trust), the other two being [freshness](https://materialize.com/blog/freshness/) and [consistency](https://materialize.com/blog/operational-consistency/).
+While being fresh and consistent is fundamental, operational work suffers if each intervention is a 15 minute deployment away.
+We all want to live in world where our operational logic is fully baked, but the reality is that things change and interactivity matters.
+Moreover, operational work is often inherently interactive: responding to user or operator queries that are not known ahead of time.
+For these reasons, among others, systems must be responsive to be a trustworthy part of your operational layer.
+
+Different architectures have different visions for how work gets done, which leads to different responsiveness characteristics.
+The conventional cloud data warehouse pulls stale data from cloud storage and re-evaluates your query, each time from scratch and at some cost.
+Dataflow engines generally re-flow the streams that define their inputs, which happens at high throughput but still takes time to cover the volume of data.
+Caches and microservices generally nail responsiveness, though without much to say about consistency or freshness.
+The caveats make none of these alternatives especially satisfying.
+
+Responsiveness is about more than just promptly providing a response: the response needs to be valuable and actionable.
+Systems can trivially respond with inconsistent, stale, or unhelpful results ('nothing yet, boss'), but we understand that this doesn't yet provide value.
+They can promptly respond to interventions with confirmation of initiation ('just starting, boss'), but this doesn't mean any work will soon be done.
+Responsiveness provides value when the response has meaning, which we believe is captured by consistency and freshness (which is why we covered them first!).
+A responsive system must promptly provide a *meaningful* response; otherwise it is just entertainment.
+
+In this post we'll dive into how Materialize makes commands responsive, from the structure it exploits in both data and queries, through the technical underpinnings, up to an example of responsive, fresh, and consistent results for non-trivial operational work involving multi-way joins.
+
+## Responsiveness in Materialize
+
+In Materialize, responsiveness is about minimizing the time between an issued command and Materialize's consistent, fresh responses (to the operator, or to downstream consumers).
+
+Achieving responsiveness is about much more than just programming hard to make computers go fast. 
+It is about preparing and organizing information ahead of time so that when commands arrive we have the answers (nearly) at hand.
+When `SELECT` commands arrive, from easy `LIMIT 1`s to hard multi-way `JOIN`s, we want to minimize the time required before Materialize can provide the result.
+When users create indexes, materialized views, and sinks, we want to minimize the time before those assets are operational.
+In each case, we want to identify and exploit structure in the data and the commands to make subsequent work fast.
+
+We also try to program rly hard, but the gains really come from the preparation instead.
+
+### Data Structure: Change Data Capture and Snapshot Roll-ups
+
+Materialize uses [change data capture](https://en.wikipedia.org/wiki/Change_data_capture) (CDC) as a way to represent continually changing data.
+Importantly, while CDC presents itself as a stream of events, it has the special structure that they always 'roll up' to a snapshot data set.
+One can interpret and operate on CDC data as if a snapshot followed by changes, without needing to retain and review the historical detail of a raw stream.
+This is an example of 'data structure' that will allow us to do something more clever than continually re-evaluating over all data we've ever seen.
+
+The CDC structure gives us a guiding principle for how to organize information: organize the snapshot and maintain it as it changes.
+Materialize durably records CDC updates, but continually compacts them to maintain a concise snapshot of input data.
+Materialize builds indexes over both input data and data derived through views, and maintains them as the data change.
+Materialize responds with snapshot data, but follows it with CDC updates that call out the changed data explicitly.
+Any tricks we can use for snapshots of data are in scope for Materialize, as long as we can extend them to *maintained* results.
+
+The superpower of CDC and roll-ups is that we know that queries have a correct and concise answer, and we can prepare our data to answer them ahead of time.
+
+### Query Structure: Data Parallelism
+
+A great deal of the value in SQL's `SELECT` command is how it draws out of complex questions the *independence* of the rows of the data.
+A `WHERE` or `HAVING` clause applies row-by-row; the result on one row does not affect the result on another row.
+A `JOIN` clause finds rows that match on key columns, whose results are independent of rows that do not match on these columns.
+A `GROUP BY` clause produces aggregates for each key, each output independent of rows with other keys.
+It is this query structure, the identified *independence*, that enables much of modern data processing optimization.
+
+Materialize's storage plane records CDC streams and maintains them as snapshots and changelogs, serving them up to other parts of the system.
+When it does serve them up, it does so in response to requests, and these requests usually have valuable context that can improve its performance.
+If a user requires only recent data, e.g. a `WHERE row.time > mz_now()`, the storage layer can return a subset of records that might pass this test.
+If a user requires only a subset of columns, e.g. a projection, the storage layer could (but does not yet) return only those columns
+If a user needs only limited results, e.g. a `LIMIT 1`, the storage layer can stop as soon as the needed number is met.
+These are each techniques from cloud data warehouses on static data, but generalize to changing data for the same SQL idioms. 
+
+Materialize's compute plane builds and maintains indexes over both input data and data derived from SQL views.
+These indexes are on key columns, or key expressions, and ensure that one can look up all records that match a certain key.
+They allow queries with `WHERE key = literal` or `WHERE key IN (lit1, lit2, lit3)` to dive directly to the relevant results, in milliseconds, rather than scan anything.
+They also enable `JOIN`s that equate the key columns to do so immediately, rather than needing to rescan and reorganize the input.
+These indexes are continually maintained, providing interactive access without sacrificing freshness or consistency as might an independent cache.
+
+Finally, Materialize's serving plane takes advantage of independence among the SQL commands themselves. 
+While Materialize must put the commands in *some* order, Materialize can see which commands can execute concurrently and does so.
+Materialize tracks the available timestamps for each input and derived view (their 'freshness'), and uses this information in determining the best order.
+When consistency or freshness is not as important to you as as responsiveness, Materialize provides tools (e.g. `SERIALIZABLE` isolation) to help navigate the trade-offs.
+
+Materialize takes advantage of existing SQL idioms you already know and expect, to provide a responsive experience.
+
+## A Worked Example: Auctions
+
+Let's take a quick look at a workload that highlights Materialize's *responsiveness* in the face of a non-trivial workload.
+We'll mostly deal with interactive queries, but the implications apply just as well to deployed dataflows into indexes, materialized views, and sinks.
+
+Our [guided tutorial](https://materialize.com/docs/get-started/quickstart/) is based around an auction load generator, which contains among other things continually evolving auctions and bids.
+One common query you might want to support is 'for each auction I (a user) have bid in, how many other users have outbid me?'
+This both calls out auctions you are currently winning, and gives a sense for the level of competition in other auctions.
+However, it is not immediately obvious how best to support this sort of query interactively.
+
+Let's start by writing some views defining the logic we'll want.
+As it turns out, the views themselves will not need to change much as we explore different ways to dial in their responsiveness.
+
+```sql
+-- All bids for auctions that have not closed.
+CREATE VIEW active_bids AS
+SELECT bids.*
+FROM bids, auctions 
+WHERE bids.auction_id = auctions.id
+  AND auctions.end_time > mz_now() 
+  AND bids.bid_time + INTERVAL '10 seconds' > mz_now();
+```
+
+```sql
+-- Number of times each buyer is outbid in each auction.
+CREATE VIEW out_bids AS
+SELECT a1.buyer, a1.auction_id, COUNT(*)
+FROM active_bids AS a1, 
+     active_bids AS a2
+WHERE a1.auction_id = a2.auction_id
+  AND a1.amount < a2.amount
+  AND a1.buyer != a2.buyer
+GROUP BY a1.buyer, a1.auction_id;
+```
+
+A first approach could be to perform the work from scratch each time a user asks.
+This is roughly what would happen if you tried to serve the application out of your data warehouse.
+While it works, doing so is all sorts of scary, and isn't even all that responsive.
+```sql
+-- From-scratch evaluation of `out_bids` with a predicate applied.
+SELECT * FROM out_bids WHERE buyer = <buyer_id>;
+```
+Materialize can push down the `mz_now()` temporal filters to the storage layer, reducing the amount of data that must be processed.
+However, we still need to collect and organize the data, which is unavoidable work to produce the correct count.
+On the plus side, we have no ongoing cost other than the storage layer maintaining `bids` and `auctions`.
+On Materialize just now, this took between 100 and 300 milliseconds to re-run (with `SERIALIZABLE` isolation).
+
+A second approach could be to materialize the whole of `out_bids`, maintaining each count for each user and auction.
+This is roughly what you'd get if you set up a stream processor, and produced the results to some serving or caching layer.
+While it also works, you'll end up spending a fair bit maintaining data you may not need, and you won't even get consistency by the end.
+```sql
+-- Index `out_bids` by the `buyer` column, for fast look-up.
+CREATE INDEX out_bids_idx ON out_bids (buyer);
+-- Random access to the index by the buyer id.
+SELECT * FROM out_bids WHERE buyer = <buyer_id>;
+```
+This approach is very responsive, reading the result directly out of an index. 
+However, there is a maintenance cost: any new bid to an auction means updates for all counts that it exceeds.
+On Materialize just now, this took consistently 20 milliseconds to re-run (with `SERIALIZABLE` isolation).
+Were I to increase the input load, I would need to quickly increase the instance size in order to keep up.
+
+A third approach is to index the intermediate `active_bids`, on both the `buyer` and `auction_id` columns.
+This is neither what you'd get in a cloud data warehouse or in a stream processor; it seems unique to Materialize.
+```sql
+-- Index `active_bids` by the `buyer` and `auction_id` columns.
+CREATE INDEX active_bids_idx1 ON active_bids (buyer);
+CREATE INDEX active_bids_idx2 ON active_bids (auction_id);
+-- Allow Materialize to cleverly use the indexes in live joins.
+SELECT * FROM out_bids WHERE buyer = <buyer_id>;
+```
+In this case Materialize will plan a `JOIN` query that uses the indexes and returns in interactive timescales.
+Informally, the query plan will start from `<buyer_id>` and pull all relevant auction identifiers from the first index, then use the second index to translate auction identifiers into the bids on those auctions, then count those records that satisfy the predicate on bid values.
+We only touch the records we are interested in, and maintaining indexes on `active_bids` takes much less effort than maintaining all of `out_bids`.
+The counts are instead produced at query time, showing a neat hybridization of pre-computation and query time computation.
+On Materialize just now, this took consistently 30 milliseconds to re-run (with `SERIALIZABLE` isolation).
+Were I to increase the input load, I would also need to increase the instance size, but not nearly as much.
+
+---
+
+If you'd like to explore any of these query plans in Materialize, just put an `EXPLAIN` in front of the `SELECT` command.
+The plans of the second and third approaches are very approachable, whereas the first (re-execution) is a whole screenful.
+But actually, taking a moment with each of them is probably very helpful, 
+
+---
+
+These three approaches to addressing a task show off several of the ways Materialize provides a responsive experience.
+The storage layer can minimize data retrieved, the compute layer can maintain results in indexes and use them to fuel interactive joins, the adapter layer can choose between them based on available assets.
+These mechanism take advantage of structure in the data and structure in the queries, keeping the right information up to date with input changes.
+Importantly, each of them provide identical output, as responsiveness does not come at the expense of consistency or freshness.
+
+## Responsiveness and Operational Agility
+
+Responsiveness is about the ability to do new things quickly.
+To answer new questions, or set up new ongoing workflows, quickly.
+To interactively probe and live-diagnose problems, with SQL queries not just key lookups, quickly.
+Responsiveness speaks to the *agility* of your operational layer.
+
+Operational tools that cannot respond quickly with actionable output are inherently clumsy and problematic.
+You, your team, or your users will work around them, giving up on hard-won consistency, freshness, or both.
+By the same token, being *meaningfully responsive* is about more than providing a prompt placeholder response.
+Operational systems need to be ready with the information you need, and be poised to correcctly implement the operational work you require.
+
+If responsiveness and operational agility sound exciting to you, we invite you to try out Materialize for yourself.
+Our [guided tutorial](https://www.materialize.com/docs/get-started/quickstart/) builds up the auction data sources described above, and includes demonstrations of consistency.
+If you'd like to try out Materialize on larger volumes of your own data, reach out about doing a [Proof of Concept](https://materialize.com/trial/) with us!
+
+<!-- ##{'timestamp':1696914000}## -->。">
+<meta property="og:title" content="Responsiveness and Operational Agility">
+<meta property="og:description" content="
+Responsiveness is one of three components of [Materialize's Trust pillar of product value](https://materialize.com/blog/operational-attributes/#trust), the other two being [freshness](https://materialize.com/blog/freshness/) and [consistency](https://materialize.com/blog/operational-consistency/).
+While being fresh and consistent is fundamental, operational work suffers if each intervention is a 15 minute deployment away.
+We all want to live in world where our operational logic is fully baked, but the reality is that things change and interactivity matters.
+Moreover, operational work is often inherently interactive: responding to user or operator queries that are not known ahead of time.
+For these reasons, among others, systems must be responsive to be a trustworthy part of your operational layer.
+
+Different architectures have different visions for how work gets done, which leads to different responsiveness characteristics.
+The conventional cloud data warehouse pulls stale data from cloud storage and re-evaluates your query, each time from scratch and at some cost.
+Dataflow engines generally re-flow the streams that define their inputs, which happens at high throughput but still takes time to cover the volume of data.
+Caches and microservices generally nail responsiveness, though without much to say about consistency or freshness.
+The caveats make none of these alternatives especially satisfying.
+
+Responsiveness is about more than just promptly providing a response: the response needs to be valuable and actionable.
+Systems can trivially respond with inconsistent, stale, or unhelpful results ('nothing yet, boss'), but we understand that this doesn't yet provide value.
+They can promptly respond to interventions with confirmation of initiation ('just starting, boss'), but this doesn't mean any work will soon be done.
+Responsiveness provides value when the response has meaning, which we believe is captured by consistency and freshness (which is why we covered them first!).
+A responsive system must promptly provide a *meaningful* response; otherwise it is just entertainment.
+
+In this post we'll dive into how Materialize makes commands responsive, from the structure it exploits in both data and queries, through the technical underpinnings, up to an example of responsive, fresh, and consistent results for non-trivial operational work involving multi-way joins.
+
+## Responsiveness in Materialize
+
+In Materialize, responsiveness is about minimizing the time between an issued command and Materialize's consistent, fresh responses (to the operator, or to downstream consumers).
+
+Achieving responsiveness is about much more than just programming hard to make computers go fast. 
+It is about preparing and organizing information ahead of time so that when commands arrive we have the answers (nearly) at hand.
+When `SELECT` commands arrive, from easy `LIMIT 1`s to hard multi-way `JOIN`s, we want to minimize the time required before Materialize can provide the result.
+When users create indexes, materialized views, and sinks, we want to minimize the time before those assets are operational.
+In each case, we want to identify and exploit structure in the data and the commands to make subsequent work fast.
+
+We also try to program rly hard, but the gains really come from the preparation instead.
+
+### Data Structure: Change Data Capture and Snapshot Roll-ups
+
+Materialize uses [change data capture](https://en.wikipedia.org/wiki/Change_data_capture) (CDC) as a way to represent continually changing data.
+Importantly, while CDC presents itself as a stream of events, it has the special structure that they always 'roll up' to a snapshot data set.
+One can interpret and operate on CDC data as if a snapshot followed by changes, without needing to retain and review the historical detail of a raw stream.
+This is an example of 'data structure' that will allow us to do something more clever than continually re-evaluating over all data we've ever seen.
+
+The CDC structure gives us a guiding principle for how to organize information: organize the snapshot and maintain it as it changes.
+Materialize durably records CDC updates, but continually compacts them to maintain a concise snapshot of input data.
+Materialize builds indexes over both input data and data derived through views, and maintains them as the data change.
+Materialize responds with snapshot data, but follows it with CDC updates that call out the changed data explicitly.
+Any tricks we can use for snapshots of data are in scope for Materialize, as long as we can extend them to *maintained* results.
+
+The superpower of CDC and roll-ups is that we know that queries have a correct and concise answer, and we can prepare our data to answer them ahead of time.
+
+### Query Structure: Data Parallelism
+
+A great deal of the value in SQL's `SELECT` command is how it draws out of complex questions the *independence* of the rows of the data.
+A `WHERE` or `HAVING` clause applies row-by-row; the result on one row does not affect the result on another row.
+A `JOIN` clause finds rows that match on key columns, whose results are independent of rows that do not match on these columns.
+A `GROUP BY` clause produces aggregates for each key, each output independent of rows with other keys.
+It is this query structure, the identified *independence*, that enables much of modern data processing optimization.
+
+Materialize's storage plane records CDC streams and maintains them as snapshots and changelogs, serving them up to other parts of the system.
+When it does serve them up, it does so in response to requests, and these requests usually have valuable context that can improve its performance.
+If a user requires only recent data, e.g. a `WHERE row.time > mz_now()`, the storage layer can return a subset of records that might pass this test.
+If a user requires only a subset of columns, e.g. a projection, the storage layer could (but does not yet) return only those columns
+If a user needs only limited results, e.g. a `LIMIT 1`, the storage layer can stop as soon as the needed number is met.
+These are each techniques from cloud data warehouses on static data, but generalize to changing data for the same SQL idioms. 
+
+Materialize's compute plane builds and maintains indexes over both input data and data derived from SQL views.
+These indexes are on key columns, or key expressions, and ensure that one can look up all records that match a certain key.
+They allow queries with `WHERE key = literal` or `WHERE key IN (lit1, lit2, lit3)` to dive directly to the relevant results, in milliseconds, rather than scan anything.
+They also enable `JOIN`s that equate the key columns to do so immediately, rather than needing to rescan and reorganize the input.
+These indexes are continually maintained, providing interactive access without sacrificing freshness or consistency as might an independent cache.
+
+Finally, Materialize's serving plane takes advantage of independence among the SQL commands themselves. 
+While Materialize must put the commands in *some* order, Materialize can see which commands can execute concurrently and does so.
+Materialize tracks the available timestamps for each input and derived view (their 'freshness'), and uses this information in determining the best order.
+When consistency or freshness is not as important to you as as responsiveness, Materialize provides tools (e.g. `SERIALIZABLE` isolation) to help navigate the trade-offs.
+
+Materialize takes advantage of existing SQL idioms you already know and expect, to provide a responsive experience.
+
+## A Worked Example: Auctions
+
+Let's take a quick look at a workload that highlights Materialize's *responsiveness* in the face of a non-trivial workload.
+We'll mostly deal with interactive queries, but the implications apply just as well to deployed dataflows into indexes, materialized views, and sinks.
+
+Our [guided tutorial](https://materialize.com/docs/get-started/quickstart/) is based around an auction load generator, which contains among other things continually evolving auctions and bids.
+One common query you might want to support is 'for each auction I (a user) have bid in, how many other users have outbid me?'
+This both calls out auctions you are currently winning, and gives a sense for the level of competition in other auctions.
+However, it is not immediately obvious how best to support this sort of query interactively.
+
+Let's start by writing some views defining the logic we'll want.
+As it turns out, the views themselves will not need to change much as we explore different ways to dial in their responsiveness.
+
+```sql
+-- All bids for auctions that have not closed.
+CREATE VIEW active_bids AS
+SELECT bids.*
+FROM bids, auctions 
+WHERE bids.auction_id = auctions.id
+  AND auctions.end_time > mz_now() 
+  AND bids.bid_time + INTERVAL '10 seconds' > mz_now();
+```
+
+```sql
+-- Number of times each buyer is outbid in each auction.
+CREATE VIEW out_bids AS
+SELECT a1.buyer, a1.auction_id, COUNT(*)
+FROM active_bids AS a1, 
+     active_bids AS a2
+WHERE a1.auction_id = a2.auction_id
+  AND a1.amount < a2.amount
+  AND a1.buyer != a2.buyer
+GROUP BY a1.buyer, a1.auction_id;
+```
+
+A first approach could be to perform the work from scratch each time a user asks.
+This is roughly what would happen if you tried to serve the application out of your data warehouse.
+While it works, doing so is all sorts of scary, and isn't even all that responsive.
+```sql
+-- From-scratch evaluation of `out_bids` with a predicate applied.
+SELECT * FROM out_bids WHERE buyer = <buyer_id>;
+```
+Materialize can push down the `mz_now()` temporal filters to the storage layer, reducing the amount of data that must be processed.
+However, we still need to collect and organize the data, which is unavoidable work to produce the correct count.
+On the plus side, we have no ongoing cost other than the storage layer maintaining `bids` and `auctions`.
+On Materialize just now, this took between 100 and 300 milliseconds to re-run (with `SERIALIZABLE` isolation).
+
+A second approach could be to materialize the whole of `out_bids`, maintaining each count for each user and auction.
+This is roughly what you'd get if you set up a stream processor, and produced the results to some serving or caching layer.
+While it also works, you'll end up spending a fair bit maintaining data you may not need, and you won't even get consistency by the end.
+```sql
+-- Index `out_bids` by the `buyer` column, for fast look-up.
+CREATE INDEX out_bids_idx ON out_bids (buyer);
+-- Random access to the index by the buyer id.
+SELECT * FROM out_bids WHERE buyer = <buyer_id>;
+```
+This approach is very responsive, reading the result directly out of an index. 
+However, there is a maintenance cost: any new bid to an auction means updates for all counts that it exceeds.
+On Materialize just now, this took consistently 20 milliseconds to re-run (with `SERIALIZABLE` isolation).
+Were I to increase the input load, I would need to quickly increase the instance size in order to keep up.
+
+A third approach is to index the intermediate `active_bids`, on both the `buyer` and `auction_id` columns.
+This is neither what you'd get in a cloud data warehouse or in a stream processor; it seems unique to Materialize.
+```sql
+-- Index `active_bids` by the `buyer` and `auction_id` columns.
+CREATE INDEX active_bids_idx1 ON active_bids (buyer);
+CREATE INDEX active_bids_idx2 ON active_bids (auction_id);
+-- Allow Materialize to cleverly use the indexes in live joins.
+SELECT * FROM out_bids WHERE buyer = <buyer_id>;
+```
+In this case Materialize will plan a `JOIN` query that uses the indexes and returns in interactive timescales.
+Informally, the query plan will start from `<buyer_id>` and pull all relevant auction identifiers from the first index, then use the second index to translate auction identifiers into the bids on those auctions, then count those records that satisfy the predicate on bid values.
+We only touch the records we are interested in, and maintaining indexes on `active_bids` takes much less effort than maintaining all of `out_bids`.
+The counts are instead produced at query time, showing a neat hybridization of pre-computation and query time computation.
+On Materialize just now, this took consistently 30 milliseconds to re-run (with `SERIALIZABLE` isolation).
+Were I to increase the input load, I would also need to increase the instance size, but not nearly as much.
+
+---
+
+If you'd like to explore any of these query plans in Materialize, just put an `EXPLAIN` in front of the `SELECT` command.
+The plans of the second and third approaches are very approachable, whereas the first (re-execution) is a whole screenful.
+But actually, taking a moment with each of them is probably very helpful, 
+
+---
+
+These three approaches to addressing a task show off several of the ways Materialize provides a responsive experience.
+The storage layer can minimize data retrieved, the compute layer can maintain results in indexes and use them to fuel interactive joins, the adapter layer can choose between them based on available assets.
+These mechanism take advantage of structure in the data and structure in the queries, keeping the right information up to date with input changes.
+Importantly, each of them provide identical output, as responsiveness does not come at the expense of consistency or freshness.
+
+## Responsiveness and Operational Agility
+
+Responsiveness is about the ability to do new things quickly.
+To answer new questions, or set up new ongoing workflows, quickly.
+To interactively probe and live-diagnose problems, with SQL queries not just key lookups, quickly.
+Responsiveness speaks to the *agility* of your operational layer.
+
+Operational tools that cannot respond quickly with actionable output are inherently clumsy and problematic.
+You, your team, or your users will work around them, giving up on hard-won consistency, freshness, or both.
+By the same token, being *meaningfully responsive* is about more than providing a prompt placeholder response.
+Operational systems need to be ready with the information you need, and be poised to correcctly implement the operational work you require.
+
+If responsiveness and operational agility sound exciting to you, we invite you to try out Materialize for yourself.
+Our [guided tutorial](https://www.materialize.com/docs/get-started/quickstart/) builds up the auction data sources described above, and includes demonstrations of consistency.
+If you'd like to try out Materialize on larger volumes of your own data, reach out about doing a [Proof of Concept](https://materialize.com/trial/) with us!
+
+<!-- ##{'timestamp':1696914000}## -->。">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://nuowoo.github.io/blog/post/Responsiveness%20and%20Operational%20Agility.html">
+<meta property="og:image" content="https://github.githubassets.com/favicons/favicon.svg">
+<title>Responsiveness and Operational Agility</title>
+<link href="//unpkg.com/@wooorm/starry-night@2.1.1/style/both.css" rel="stylesheet" />
+
+
+</head>
+<style>
+body{box-sizing: border-box;min-width: 200px;max-width: 900px;margin: 20px auto;padding: 45px;font-size: 16px;font-family: sans-serif;line-height: 1.25;}
+#header{display:flex;padding-bottom:8px;border-bottom: 1px solid var(--borderColor-muted, var(--color-border-muted));margin-bottom: 16px;}
+#footer {margin-top:64px; text-align: center;font-size: small;}
+
+</style>
+
+<style>
+.postTitle{margin: auto 0;font-size:40px;font-weight:bold;}
+.title-right{display:flex;margin:auto 0 0 auto;}
+.title-right .circle{padding: 14px 16px;margin-right:8px;}
+#postBody{border-bottom: 1px solid var(--color-border-default);padding-bottom:36px;}
+#postBody hr{height:2px;}
+#cmButton{height:48px;margin-top:48px;}
+#comments{margin-top:64px;}
+.g-emoji{font-size:24px;}
+@media (max-width: 600px) {
+    body {padding: 8px;}
+    .postTitle{font-size:24px;}
+}
+.copy-feedback {
+    display: none;
+    position: absolute;
+    top: 10px;
+    right: 50px;
+    color: var(--color-fg-on-emphasis);
+    background-color: var(--color-fg-muted);
+    border-radius: 3px;
+    padding: 5px 8px;
+    font-size: 12px;
+}
+</style>
+
+
+
+
+<body>
+    <div id="header">
+<h1 class="postTitle">Responsiveness and Operational Agility</h1>
+<div class="title-right">
+    <a href="https://nuowoo.github.io/blog" id="buttonHome" class="btn btn-invisible circle" title="首页">
+        <svg class="octicon" width="16" height="16">
+            <path id="pathHome" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+    
+    <a href="https://github.com/nuowoo/blog/issues/7" target="_blank" class="btn btn-invisible circle" title="Issue">
+        <svg class="octicon" width="16" height="16">
+            <path id="pathIssue" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+    
+
+    <a class="btn btn-invisible circle" onclick="modeSwitch();" title="切换主题">
+        <svg class="octicon" width="16" height="16" >
+            <path id="themeSwitch" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+
+</div>
+</div>
+    <div id="content">
+<div class="markdown-body" id="postBody"><p>Responsiveness is one of three components of <a href="https://materialize.com/blog/operational-attributes/#trust" rel="nofollow">Materialize's Trust pillar of product value</a>, the other two being <a href="https://materialize.com/blog/freshness/" rel="nofollow">freshness</a> and <a href="https://materialize.com/blog/operational-consistency/" rel="nofollow">consistency</a>.<br>
+While being fresh and consistent is fundamental, operational work suffers if each intervention is a 15 minute deployment away.<br>
+We all want to live in world where our operational logic is fully baked, but the reality is that things change and interactivity matters.<br>
+Moreover, operational work is often inherently interactive: responding to user or operator queries that are not known ahead of time.<br>
+For these reasons, among others, systems must be responsive to be a trustworthy part of your operational layer.</p>
+<p>Different architectures have different visions for how work gets done, which leads to different responsiveness characteristics.<br>
+The conventional cloud data warehouse pulls stale data from cloud storage and re-evaluates your query, each time from scratch and at some cost.<br>
+Dataflow engines generally re-flow the streams that define their inputs, which happens at high throughput but still takes time to cover the volume of data.<br>
+Caches and microservices generally nail responsiveness, though without much to say about consistency or freshness.<br>
+The caveats make none of these alternatives especially satisfying.</p>
+<p>Responsiveness is about more than just promptly providing a response: the response needs to be valuable and actionable.<br>
+Systems can trivially respond with inconsistent, stale, or unhelpful results ("nothing yet, boss"), but we understand that this doesn't yet provide value.<br>
+They can promptly respond to interventions with confirmation of initiation ("just starting, boss"), but this doesn't mean any work will soon be done.<br>
+Responsiveness provides value when the response has meaning, which we believe is captured by consistency and freshness (which is why we covered them first!).<br>
+A responsive system must promptly provide a <em>meaningful</em> response; otherwise it is just entertainment.</p>
+<p>In this post we'll dive into how Materialize makes commands responsive, from the structure it exploits in both data and queries, through the technical underpinnings, up to an example of responsive, fresh, and consistent results for non-trivial operational work involving multi-way joins.</p>
+<h2>Responsiveness in Materialize</h2>
+<p>In Materialize, responsiveness is about minimizing the time between an issued command and Materialize's consistent, fresh responses (to the operator, or to downstream consumers).</p>
+<p>Achieving responsiveness is about much more than just programming hard to make computers go fast.<br>
+It is about preparing and organizing information ahead of time so that when commands arrive we have the answers (nearly) at hand.<br>
+When <code class="notranslate">SELECT</code> commands arrive, from easy <code class="notranslate">LIMIT 1</code>s to hard multi-way <code class="notranslate">JOIN</code>s, we want to minimize the time required before Materialize can provide the result.<br>
+When users create indexes, materialized views, and sinks, we want to minimize the time before those assets are operational.<br>
+In each case, we want to identify and exploit structure in the data and the commands to make subsequent work fast.</p>
+<p>We also try to program rly hard, but the gains really come from the preparation instead.</p>
+<h3>Data Structure: Change Data Capture and Snapshot Roll-ups</h3>
+<p>Materialize uses <a href="https://en.wikipedia.org/wiki/Change_data_capture" rel="nofollow">change data capture</a> (CDC) as a way to represent continually changing data.<br>
+Importantly, while CDC presents itself as a stream of events, it has the special structure that they always "roll up" to a snapshot data set.<br>
+One can interpret and operate on CDC data as if a snapshot followed by changes, without needing to retain and review the historical detail of a raw stream.<br>
+This is an example of "data structure" that will allow us to do something more clever than continually re-evaluating over all data we've ever seen.</p>
+<p>The CDC structure gives us a guiding principle for how to organize information: organize the snapshot and maintain it as it changes.<br>
+Materialize durably records CDC updates, but continually compacts them to maintain a concise snapshot of input data.<br>
+Materialize builds indexes over both input data and data derived through views, and maintains them as the data change.<br>
+Materialize responds with snapshot data, but follows it with CDC updates that call out the changed data explicitly.<br>
+Any tricks we can use for snapshots of data are in scope for Materialize, as long as we can extend them to <em>maintained</em> results.</p>
+<p>The superpower of CDC and roll-ups is that we know that queries have a correct and concise answer, and we can prepare our data to answer them ahead of time.</p>
+<h3>Query Structure: Data Parallelism</h3>
+<p>A great deal of the value in SQL's <code class="notranslate">SELECT</code> command is how it draws out of complex questions the <em>independence</em> of the rows of the data.<br>
+A <code class="notranslate">WHERE</code> or <code class="notranslate">HAVING</code> clause applies row-by-row; the result on one row does not affect the result on another row.<br>
+A <code class="notranslate">JOIN</code> clause finds rows that match on key columns, whose results are independent of rows that do not match on these columns.<br>
+A <code class="notranslate">GROUP BY</code> clause produces aggregates for each key, each output independent of rows with other keys.<br>
+It is this query structure, the identified <em>independence</em>, that enables much of modern data processing optimization.</p>
+<p>Materialize's storage plane records CDC streams and maintains them as snapshots and changelogs, serving them up to other parts of the system.<br>
+When it does serve them up, it does so in response to requests, and these requests usually have valuable context that can improve its performance.<br>
+If a user requires only recent data, e.g. a <code class="notranslate">WHERE row.time &gt; mz_now()</code>, the storage layer can return a subset of records that might pass this test.<br>
+If a user requires only a subset of columns, e.g. a projection, the storage layer could (but does not yet) return only those columns<br>
+If a user needs only limited results, e.g. a <code class="notranslate">LIMIT 1</code>, the storage layer can stop as soon as the needed number is met.<br>
+These are each techniques from cloud data warehouses on static data, but generalize to changing data for the same SQL idioms.</p>
+<p>Materialize's compute plane builds and maintains indexes over both input data and data derived from SQL views.<br>
+These indexes are on key columns, or key expressions, and ensure that one can look up all records that match a certain key.<br>
+They allow queries with <code class="notranslate">WHERE key = literal</code> or <code class="notranslate">WHERE key IN (lit1, lit2, lit3)</code> to dive directly to the relevant results, in milliseconds, rather than scan anything.<br>
+They also enable <code class="notranslate">JOIN</code>s that equate the key columns to do so immediately, rather than needing to rescan and reorganize the input.<br>
+These indexes are continually maintained, providing interactive access without sacrificing freshness or consistency as might an independent cache.</p>
+<p>Finally, Materialize's serving plane takes advantage of independence among the SQL commands themselves.<br>
+While Materialize must put the commands in <em>some</em> order, Materialize can see which commands can execute concurrently and does so.<br>
+Materialize tracks the available timestamps for each input and derived view (their "freshness"), and uses this information in determining the best order.<br>
+When consistency or freshness is not as important to you as as responsiveness, Materialize provides tools (e.g. <code class="notranslate">SERIALIZABLE</code> isolation) to help navigate the trade-offs.</p>
+<p>Materialize takes advantage of existing SQL idioms you already know and expect, to provide a responsive experience.</p>
+<h2>A Worked Example: Auctions</h2>
+<p>Let's take a quick look at a workload that highlights Materialize's <em>responsiveness</em> in the face of a non-trivial workload.<br>
+We'll mostly deal with interactive queries, but the implications apply just as well to deployed dataflows into indexes, materialized views, and sinks.</p>
+<p>Our <a href="https://materialize.com/docs/get-started/quickstart/" rel="nofollow">guided tutorial</a> is based around an auction load generator, which contains among other things continually evolving auctions and bids.<br>
+One common query you might want to support is "for each auction I (a user) have bid in, how many other users have outbid me?"<br>
+This both calls out auctions you are currently winning, and gives a sense for the level of competition in other auctions.<br>
+However, it is not immediately obvious how best to support this sort of query interactively.</p>
+<p>Let's start by writing some views defining the logic we'll want.<br>
+As it turns out, the views themselves will not need to change much as we explore different ways to dial in their responsiveness.</p>
+<div class="highlight highlight-source-sql"><pre class="notranslate"><span class="pl-c"><span class="pl-c">--</span> All bids for auctions that have not closed.</span>
+<span class="pl-k">CREATE</span> <span class="pl-k">VIEW</span> <span class="pl-en">active_bids</span> <span class="pl-k">AS</span>
+<span class="pl-k">SELECT</span> bids.<span class="pl-k">*</span>
+<span class="pl-k">FROM</span> bids, auctions 
+<span class="pl-k">WHERE</span> <span class="pl-c1">bids</span>.<span class="pl-c1">auction_id</span> <span class="pl-k">=</span> <span class="pl-c1">auctions</span>.<span class="pl-c1">id</span>
+  <span class="pl-k">AND</span> <span class="pl-c1">auctions</span>.<span class="pl-c1">end_time</span> <span class="pl-k">&gt;</span> mz_now() 
+  <span class="pl-k">AND</span> <span class="pl-c1">bids</span>.<span class="pl-c1">bid_time</span> <span class="pl-k">+</span> INTERVAL <span class="pl-s"><span class="pl-pds">'</span>10 seconds<span class="pl-pds">'</span></span> <span class="pl-k">&gt;</span> mz_now();</pre></div>
+<div class="highlight highlight-source-sql"><pre class="notranslate"><span class="pl-c"><span class="pl-c">--</span> Number of times each buyer is outbid in each auction.</span>
+<span class="pl-k">CREATE</span> <span class="pl-k">VIEW</span> <span class="pl-en">out_bids</span> <span class="pl-k">AS</span>
+<span class="pl-k">SELECT</span> <span class="pl-c1">a1</span>.<span class="pl-c1">buyer</span>, <span class="pl-c1">a1</span>.<span class="pl-c1">auction_id</span>, <span class="pl-c1">COUNT</span>(<span class="pl-k">*</span>)
+<span class="pl-k">FROM</span> active_bids <span class="pl-k">AS</span> a1, 
+     active_bids <span class="pl-k">AS</span> a2
+<span class="pl-k">WHERE</span> <span class="pl-c1">a1</span>.<span class="pl-c1">auction_id</span> <span class="pl-k">=</span> <span class="pl-c1">a2</span>.<span class="pl-c1">auction_id</span>
+  <span class="pl-k">AND</span> <span class="pl-c1">a1</span>.<span class="pl-c1">amount</span> <span class="pl-k">&lt;</span> <span class="pl-c1">a2</span>.<span class="pl-c1">amount</span>
+  <span class="pl-k">AND</span> <span class="pl-c1">a1</span>.<span class="pl-c1">buyer</span> <span class="pl-k">!=</span> <span class="pl-c1">a2</span>.<span class="pl-c1">buyer</span>
+<span class="pl-k">GROUP BY</span> <span class="pl-c1">a1</span>.<span class="pl-c1">buyer</span>, <span class="pl-c1">a1</span>.<span class="pl-c1">auction_id</span>;</pre></div>
+<p>A first approach could be to perform the work from scratch each time a user asks.<br>
+This is roughly what would happen if you tried to serve the application out of your data warehouse.<br>
+While it works, doing so is all sorts of scary, and isn't even all that responsive.</p>
+<div class="highlight highlight-source-sql"><pre class="notranslate"><span class="pl-c"><span class="pl-c">--</span> From-scratch evaluation of `out_bids` with a predicate applied.</span>
+<span class="pl-k">SELECT</span> <span class="pl-k">*</span> <span class="pl-k">FROM</span> out_bids <span class="pl-k">WHERE</span> buyer <span class="pl-k">=</span> <span class="pl-k">&lt;</span>buyer_id<span class="pl-k">&gt;</span>;</pre></div>
+<p>Materialize can push down the <code class="notranslate">mz_now()</code> temporal filters to the storage layer, reducing the amount of data that must be processed.<br>
+However, we still need to collect and organize the data, which is unavoidable work to produce the correct count.<br>
+On the plus side, we have no ongoing cost other than the storage layer maintaining <code class="notranslate">bids</code> and <code class="notranslate">auctions</code>.<br>
+On Materialize just now, this took between 100 and 300 milliseconds to re-run (with <code class="notranslate">SERIALIZABLE</code> isolation).</p>
+<p>A second approach could be to materialize the whole of <code class="notranslate">out_bids</code>, maintaining each count for each user and auction.<br>
+This is roughly what you'd get if you set up a stream processor, and produced the results to some serving or caching layer.<br>
+While it also works, you'll end up spending a fair bit maintaining data you may not need, and you won't even get consistency by the end.</p>
+<div class="highlight highlight-source-sql"><pre class="notranslate"><span class="pl-c"><span class="pl-c">--</span> Index `out_bids` by the `buyer` column, for fast look-up.</span>
+<span class="pl-k">CREATE</span> <span class="pl-k">INDEX</span> <span class="pl-en">out_bids_idx</span> <span class="pl-k">ON</span> out_bids (buyer);
+<span class="pl-c"><span class="pl-c">--</span> Random access to the index by the buyer id.</span>
+<span class="pl-k">SELECT</span> <span class="pl-k">*</span> <span class="pl-k">FROM</span> out_bids <span class="pl-k">WHERE</span> buyer <span class="pl-k">=</span> <span class="pl-k">&lt;</span>buyer_id<span class="pl-k">&gt;</span>;</pre></div>
+<p>This approach is very responsive, reading the result directly out of an index.<br>
+However, there is a maintenance cost: any new bid to an auction means updates for all counts that it exceeds.<br>
+On Materialize just now, this took consistently 20 milliseconds to re-run (with <code class="notranslate">SERIALIZABLE</code> isolation).<br>
+Were I to increase the input load, I would need to quickly increase the instance size in order to keep up.</p>
+<p>A third approach is to index the intermediate <code class="notranslate">active_bids</code>, on both the <code class="notranslate">buyer</code> and <code class="notranslate">auction_id</code> columns.<br>
+This is neither what you'd get in a cloud data warehouse or in a stream processor; it seems unique to Materialize.</p>
+<div class="highlight highlight-source-sql"><pre class="notranslate"><span class="pl-c"><span class="pl-c">--</span> Index `active_bids` by the `buyer` and `auction_id` columns.</span>
+<span class="pl-k">CREATE</span> <span class="pl-k">INDEX</span> <span class="pl-en">active_bids_idx1</span> <span class="pl-k">ON</span> active_bids (buyer);
+<span class="pl-k">CREATE</span> <span class="pl-k">INDEX</span> <span class="pl-en">active_bids_idx2</span> <span class="pl-k">ON</span> active_bids (auction_id);
+<span class="pl-c"><span class="pl-c">--</span> Allow Materialize to cleverly use the indexes in live joins.</span>
+<span class="pl-k">SELECT</span> <span class="pl-k">*</span> <span class="pl-k">FROM</span> out_bids <span class="pl-k">WHERE</span> buyer <span class="pl-k">=</span> <span class="pl-k">&lt;</span>buyer_id<span class="pl-k">&gt;</span>;</pre></div>
+<p>In this case Materialize will plan a <code class="notranslate">JOIN</code> query that uses the indexes and returns in interactive timescales.<br>
+Informally, the query plan will start from <code class="notranslate">&lt;buyer_id&gt;</code> and pull all relevant auction identifiers from the first index, then use the second index to translate auction identifiers into the bids on those auctions, then count those records that satisfy the predicate on bid values.<br>
+We only touch the records we are interested in, and maintaining indexes on <code class="notranslate">active_bids</code> takes much less effort than maintaining all of <code class="notranslate">out_bids</code>.<br>
+The counts are instead produced at query time, showing a neat hybridization of pre-computation and query time computation.<br>
+On Materialize just now, this took consistently 30 milliseconds to re-run (with <code class="notranslate">SERIALIZABLE</code> isolation).<br>
+Were I to increase the input load, I would also need to increase the instance size, but not nearly as much.</p>
+<hr>
+<p>If you'd like to explore any of these query plans in Materialize, just put an <code class="notranslate">EXPLAIN</code> in front of the <code class="notranslate">SELECT</code> command.<br>
+The plans of the second and third approaches are very approachable, whereas the first (re-execution) is a whole screenful.<br>
+But actually, taking a moment with each of them is probably very helpful,</p>
+<hr>
+<p>These three approaches to addressing a task show off several of the ways Materialize provides a responsive experience.<br>
+The storage layer can minimize data retrieved, the compute layer can maintain results in indexes and use them to fuel interactive joins, the adapter layer can choose between them based on available assets.<br>
+These mechanism take advantage of structure in the data and structure in the queries, keeping the right information up to date with input changes.<br>
+Importantly, each of them provide identical output, as responsiveness does not come at the expense of consistency or freshness.</p>
+<h2>Responsiveness and Operational Agility</h2>
+<p>Responsiveness is about the ability to do new things quickly.<br>
+To answer new questions, or set up new ongoing workflows, quickly.<br>
+To interactively probe and live-diagnose problems, with SQL queries not just key lookups, quickly.<br>
+Responsiveness speaks to the <em>agility</em> of your operational layer.</p>
+<p>Operational tools that cannot respond quickly with actionable output are inherently clumsy and problematic.<br>
+You, your team, or your users will work around them, giving up on hard-won consistency, freshness, or both.<br>
+By the same token, being <em>meaningfully responsive</em> is about more than providing a prompt placeholder response.<br>
+Operational systems need to be ready with the information you need, and be poised to correcctly implement the operational work you require.</p>
+<p>If responsiveness and operational agility sound exciting to you, we invite you to try out Materialize for yourself.<br>
+Our <a href="https://www.materialize.com/docs/get-started/quickstart/" rel="nofollow">guided tutorial</a> builds up the auction data sources described above, and includes demonstrations of consistency.<br>
+If you'd like to try out Materialize on larger volumes of your own data, reach out about doing a <a href="https://materialize.com/trial/" rel="nofollow">Proof of Concept</a> with us!</p>
+</div>
+<div style="font-size:small;margin-top:8px;float:right;"></div>
+
+<button class="btn btn-block" type="button" onclick="openComments()" id="cmButton">评论</button>
+<div class="comments" id="comments"></div>
+
+</div>
+    <div id="footer"><div id="footer1">Copyright © <span id="copyrightYear"></span> <a href="https://nuowoo.github.io/blog">Computer Scientist</a></div>
+<div id="footer2">
+    <span id="runday"></span><span>Powered by <a href="https://meekdai.com/Gmeek.html" target="_blank">Gmeek</a></span>
+</div>
+
+<script>
+var now=new Date();
+document.getElementById("copyrightYear").innerHTML=now.getFullYear();
+
+if(""!=""){
+    var startSite=new Date("");
+    var diff=now.getTime()-startSite.getTime();
+    var diffDay=Math.floor(diff/(1000*60*60*24));
+    document.getElementById("runday").innerHTML="网站运行"+diffDay+"天"+" • ";
+}
+</script></div>
+</body>
+<script>
+var IconList={'sun': 'M8 10.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5zM8 12a4 4 0 100-8 4 4 0 000 8zM8 0a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0V.75A.75.75 0 018 0zm0 13a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0v-1.5A.75.75 0 018 13zM2.343 2.343a.75.75 0 011.061 0l1.06 1.061a.75.75 0 01-1.06 1.06l-1.06-1.06a.75.75 0 010-1.06zm9.193 9.193a.75.75 0 011.06 0l1.061 1.06a.75.75 0 01-1.06 1.061l-1.061-1.06a.75.75 0 010-1.061zM16 8a.75.75 0 01-.75.75h-1.5a.75.75 0 010-1.5h1.5A.75.75 0 0116 8zM3 8a.75.75 0 01-.75.75H.75a.75.75 0 010-1.5h1.5A.75.75 0 013 8zm10.657-5.657a.75.75 0 010 1.061l-1.061 1.06a.75.75 0 11-1.06-1.06l1.06-1.06a.75.75 0 011.06 0zm-9.193 9.193a.75.75 0 010 1.06l-1.06 1.061a.75.75 0 11-1.061-1.06l1.06-1.061a.75.75 0 011.061 0z', 'moon': 'M9.598 1.591a.75.75 0 01.785-.175 7 7 0 11-8.967 8.967.75.75 0 01.961-.96 5.5 5.5 0 007.046-7.046.75.75 0 01.175-.786zm1.616 1.945a7 7 0 01-7.678 7.678 5.5 5.5 0 107.678-7.678z', 'sync': 'M1.705 8.005a.75.75 0 0 1 .834.656 5.5 5.5 0 0 0 9.592 2.97l-1.204-1.204a.25.25 0 0 1 .177-.427h3.646a.25.25 0 0 1 .25.25v3.646a.25.25 0 0 1-.427.177l-1.38-1.38A7.002 7.002 0 0 1 1.05 8.84a.75.75 0 0 1 .656-.834ZM8 2.5a5.487 5.487 0 0 0-4.131 1.869l1.204 1.204A.25.25 0 0 1 4.896 6H1.25A.25.25 0 0 1 1 5.75V2.104a.25.25 0 0 1 .427-.177l1.38 1.38A7.002 7.002 0 0 1 14.95 7.16a.75.75 0 0 1-1.49.178A5.5 5.5 0 0 0 8 2.5Z', 'home': 'M6.906.664a1.749 1.749 0 0 1 2.187 0l5.25 4.2c.415.332.657.835.657 1.367v7.019A1.75 1.75 0 0 1 13.25 15h-3.5a.75.75 0 0 1-.75-.75V9H7v5.25a.75.75 0 0 1-.75.75h-3.5A1.75 1.75 0 0 1 1 13.25V6.23c0-.531.242-1.034.657-1.366l5.25-4.2Zm1.25 1.171a.25.25 0 0 0-.312 0l-5.25 4.2a.25.25 0 0 0-.094.196v7.019c0 .138.112.25.25.25H5.5V8.25a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 .75.75v5.25h2.75a.25.25 0 0 0 .25-.25V6.23a.25.25 0 0 0-.094-.195Z', 'github': 'M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z', 'copy': 'M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z', 'check': 'M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z'};
+var utterancesLoad=0;
+
+let themeSettings={
+    "dark": ["dark","moon","#00f0ff","dark-blue"],
+    "light": ["light","sun","#ff5000","github-light"],
+    "auto": ["auto","sync","","preferred-color-scheme"]
+};
+function changeTheme(mode, icon, color, utheme){
+    document.documentElement.setAttribute("data-color-mode",mode);
+    document.getElementById("themeSwitch").setAttribute("d",value=IconList[icon]);
+    document.getElementById("themeSwitch").parentNode.style.color=color;
+    if(utterancesLoad==1){utterancesTheme(utheme);}
+}
+function modeSwitch(){
+    let currentMode=document.documentElement.getAttribute('data-color-mode');
+    let newMode = currentMode === "light" ? "dark" : currentMode === "dark" ? "auto" : "light";
+    localStorage.setItem("meek_theme", newMode);
+    if(themeSettings[newMode]){
+        changeTheme(...themeSettings[newMode]);
+    }
+}
+function utterancesTheme(theme){
+    const message={type:'set-theme',theme: theme};
+    const iframe=document.getElementsByClassName('utterances-frame')[0];
+    iframe.contentWindow.postMessage(message,'https://utteranc.es');
+}
+if(themeSettings[theme]){changeTheme(...themeSettings[theme]);}
+console.log("\n %c Gmeek last https://github.com/Meekdai/Gmeek \n","padding:5px 0;background:#02d81d;color:#fff");
+</script>
+
+<script>
+document.getElementById("pathHome").setAttribute("d",IconList["home"]);
+document.getElementById("pathIssue").setAttribute("d",IconList["github"]);
+
+
+
+function openComments(){
+    cm=document.getElementById("comments");
+    cmButton=document.getElementById("cmButton");
+    cmButton.innerHTML="loading";
+    span=document.createElement("span");
+    span.setAttribute("class","AnimatedEllipsis");
+    cmButton.appendChild(span);
+
+    script=document.createElement("script");
+    script.setAttribute("src","https://utteranc.es/client.js");
+    script.setAttribute("repo","nuowoo/blog");
+    script.setAttribute("issue-term","title");
+    
+    if(localStorage.getItem("meek_theme")=="dark"){script.setAttribute("theme","dark-blue");}
+    else if(localStorage.getItem("meek_theme")=="light") {script.setAttribute("theme","github-light");}
+    else{script.setAttribute("theme","preferred-color-scheme");}
+    
+    script.setAttribute("crossorigin","anonymous");
+    script.setAttribute("async","");
+    cm.appendChild(script);
+
+    int=self.setInterval("iFrameLoading()",200);
+}
+
+function iFrameLoading(){
+    var utterances=document.getElementsByClassName('utterances');
+    if(utterances.length==1){
+        if(utterances[0].style.height!=""){
+            utterancesLoad=1;
+            int=window.clearInterval(int);
+            document.getElementById("cmButton").style.display="none";
+            console.log("utterances Load OK");
+        }
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const createClipboardHTML = (codeContent, additionalClasses = '') => `
+        <pre class="notranslate"><code class="notranslate">${codeContent}</code></pre>
+        <div class="clipboard-container position-absolute right-0 top-0 ${additionalClasses}">
+            <clipboard-copy class="ClipboardButton btn m-2 p-0" role="button" style="display: inherit;">
+                <svg height="16" width="16" class="octicon octicon-copy m-2"><path d="${IconList["copy"]}"></path></svg>
+                <svg height="16" width="16" class="octicon octicon-check color-fg-success m-2 d-none"><path d="${IconList["check"]}"></path></svg>
+            </clipboard-copy>
+            <div class="copy-feedback">Copied!</div>
+        </div>
+    `;
+
+    const handleCodeElements = (selector = '') => {
+        document.querySelectorAll(selector).forEach(codeElement => {
+            const codeContent = codeElement.innerHTML;
+            const newStructure = document.createElement('div');
+            newStructure.className = 'snippet-clipboard-content position-relative overflow-auto';
+            newStructure.innerHTML = createClipboardHTML(codeContent);
+
+            const parentElement = codeElement.parentElement;
+            if (selector.includes('highlight')) {
+                parentElement.insertBefore(newStructure, codeElement.nextSibling);
+                parentElement.removeChild(codeElement);
+            } else {
+                parentElement.parentElement.replaceChild(newStructure, parentElement);
+            }
+        });
+    };
+
+    handleCodeElements('pre.notranslate > code.notranslate');
+    handleCodeElements('div.highlight > pre.notranslate');
+
+    let currentFeedback = null;
+    document.querySelectorAll('clipboard-copy').forEach(copyButton => {
+        copyButton.addEventListener('click', () => {
+            const codeContent = copyButton.closest('.snippet-clipboard-content').innerText;
+            const tempTextArea = document.createElement('textarea');
+            tempTextArea.value = codeContent;
+            document.body.appendChild(tempTextArea);
+            tempTextArea.select();
+            document.execCommand('copy');
+            document.body.removeChild(tempTextArea);
+
+            const copyIcon = copyButton.querySelector('.octicon-copy');
+            const checkIcon = copyButton.querySelector('.octicon-check');
+            const copyFeedback = copyButton.nextElementSibling;
+
+            if (currentFeedback && currentFeedback !== copyFeedback) {currentFeedback.style.display = 'none';}
+            currentFeedback = copyFeedback;
+
+            copyIcon.classList.add('d-none');
+            checkIcon.classList.remove('d-none');
+            copyFeedback.style.display = 'block';
+            copyButton.style.borderColor = 'var(--color-success-fg)';
+
+            setTimeout(() => {
+                copyIcon.classList.remove('d-none');
+                checkIcon.classList.add('d-none');
+                copyFeedback.style.display = 'none';
+                copyButton.style.borderColor = '';
+            }, 2000);
+        });
+    });
+});
+
+</script>
+
+
+</html>
