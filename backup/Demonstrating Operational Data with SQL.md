@@ -1,7 +1,3 @@
-<a href="https://yllix.com/publishers/847466" target="_blank">
-<img src="https://ylx-aff.advertica-cdn.com/pub/728x90.png" style="border:none;margin:0;padding:0;vertical-align:baseline;" alt="ylliX - Online Advertising Network" /></a>
-
-
 Databases, Big Data, and Stream Processors have long had the property that it can be hard to *demonstrate* their value, like in a demo setting.
 Databases coordinate the work of multiple teams of independent workers, and don't shine when there is just one user.
 Big Data systems introduce scalable patterns that can be purely overhead when the data fit on a single laptop.
