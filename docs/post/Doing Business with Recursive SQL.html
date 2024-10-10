@@ -1,0 +1,961 @@
+<!DOCTYPE html>
+<html data-color-mode="light" data-dark-theme="dark" data-light-theme="light" lang="zh-CN">
+<head>
+    <meta content="text/html; charset=utf-8" http-equiv="content-type" />
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <link href='https://mirrors.sustech.edu.cn/cdnjs/ajax/libs/Primer/21.0.7/primer.css' rel='stylesheet' />
+    <script src='https://blog.meekdai.com/Gmeek/plugins/GmeekVercount.js'></script>,<script type='text/javascript' src='https://udbaa.com/bnr.php?section=GeneralA&pub=847466&format=728x90&ga=g'></script>
+    <link rel="icon" href="https://github.githubassets.com/favicons/favicon.svg"><script>
+        let theme = localStorage.getItem("meek_theme") || "light";
+        document.documentElement.setAttribute("data-color-mode", theme);
+    </script>
+<meta name="description" content="
+Let's take a look at a fundamental problem in economics, with applications to doing business: matching up producers and consumers of some abstract resource, in a way that appeals to all of the participants.
+
+Imagine we have a set of producers and a set of consumers, each of whom wants to be matched to one member of the opposite type, and each of them have some (not neccesarily shared) preference for the other.
+The problem was initially presented in the language of 'stable marriage', but it applies to any pairings where the participants have opinions about those they might be paired with.
+The framing has also been applied to matching hospital residents with hospitals, application clients with server capacity, and in this post hungry engineers and their lunching options.
+You should be able to apply it to a variety of settings, most fruitfully when the matched things come with a rich variety of opinions about each other.
+
+To spill the beans, there already is an algorithm for [stable matching](https://en.wikipedia.org/wiki/Stable_marriage_problem), and we're just going to implement it in recursive SQL.
+You might not have thought of SQL as a language for *algorithms*, and conventional SQL is certainly very limited in this respect.
+However, recursive SQL can be a great fit, and when it is there's no reason not to just lean on the existing approaches!
+
+### Stable Matching in SQL
+
+We will work off of a table `prefs` that will store the mutual preferences between pairs of producer and consumer.
+Not every pair needs to be represented here, and any pairs that are absent will just be taken to be non-viable.
+We'll call producers and consumers by `name1` and `name2`, respectively, which aren't very evocative but are easier to type.
+Each pair will have integer preferences `pref1` and `pref2` for each other, where smaller numbers mean higher preference (imaging them as a ranking).
+
+```sql
+-- Each entry indicates a potential connection between `name1` and `name2`.
+-- Each has a numerical preference for this, where we'll take smaller to be better.
+-- The goal is to match up `(name1, name2)` pairs where each prefers the other over
+-- any other 'stable' pairing (someone else who likes them back enough not to leave).
+CREATE TABLE prefs(name1 TEXT, pref1 INT, name2 TEXT, pref2 INT);
+```
+
+Our goal is to pull out a subset of `prefs` where each `name1` and `name2` occur at most once.
+Also, we shouldn't leave behind any pairing in which each prefers the other more than the pair they were assigned.
+That second part is where the algorithm comes in.
+
+Of course, we'll want some example preferences to work with.
+Let's start with some hungry engineers and food options.
+Thematically, let's imagine that each human prefers the foods based on their own unaccountable tastes, and the food options (restaurants) prefer the humans based on their distance (because each's price doesn't vary as a function of the human, but the delivery cost does).
+
+Here's some made up data that will show off what we are trying to do.
+
+```sql
+-- Imagine people have a preference for foods that idk is based on its price.
+-- Imagine restaurants have a preference for people based on their distance.
+INSERT INTO prefs VALUES
+('frank',  4, 'ramen', 1),  -- frank needs food, and ramen likes him best
+('arjun',  1, 'ramen', 3),  -- arjun lovel ramen, but it is unrequited.
+('arjun',  3, 'sushi', 4),  -- arjun can tolerate sushi; they prefer him to nikhil.
+('nikhil', 1, 'sushi', 5);  -- nikhil is too far away to safely enjoy sushi.
+```
+
+If we study the data (and the comments) we will find that one stable matching is 
+```
+ name1 | pref1 | name2 | pref2 
+-------+-------+-------+-------
+ arjun |     3 | sushi |     4
+ frank |     4 | ramen |     1
+(2 rows)
+```
+Nikhil doesn't get lunch in this story, which is too bad, but is a demonstration of the constraints: not everyone gets what they want.
+Arjun also doesn't get what he wants, which is ramen, because it isn't stable: the ramen-ya would just hit Frank up and they'd do lunch instead.
+It turns out there aren't other stable matchings for this data, but in general there can be many.
+
+How do we arrive at a stable matching?
+Fortunately, way back in 1962, [Gale and Shapley proposed](https://web.archive.org/web/20170925172517/http://www.dtic.mil/get-tr-doc/pdf?AD=AD0251958) an algorithm to do just that.
+In one variant: each producer proposes to satisfy their favorite consumer, each consumer definitively rejects all but the best proposal, and spurned proposers repeat with their next best options, until the rejections stop or they run out of options.
+
+It's pretty much recursion, isn't it? 
+And moreover, each of the steps are pretty easy SQL.
+Let's write them down!
+
+```sql
+-- Iteratively develop proposals and rejections.
+WITH MUTUALLY RECURSIVE
+    -- Pairings that have yet not been explicitly rejected.
+    active(name1 TEXT, pref1 INT, name2 TEXT, pref2 INT) AS (
+        SELECT * FROM prefs
+        EXCEPT ALL
+        SELECT * FROM rejects
+    ),
+    -- Each `name1` proposes to its favorite-est `name2`.
+    proposals(name1 TEXT, pref1 INT, name2 TEXT, pref2 INT) AS (
+        SELECT DISTINCT ON (name1) *
+        FROM active
+        ORDER BY name1, pref1, name2, pref2
+    ),
+    -- Each `name2` tentatively accepts the proposal from its favorite-est `name1`
+    tentative(name1 TEXT, pref1 INT, name2 TEXT, pref2 INT) AS (
+        SELECT DISTINCT ON (name2) *
+        FROM proposals
+        ORDER BY name2, pref2, name1, pref1
+    ),
+    -- Proposals that are not accepted become definitively rejected.
+    rejects(name1 TEXT, pref1 INT, name2 TEXT, pref2 INT) AS (
+        SELECT * FROM rejects
+        UNION ALL
+        SELECT * FROM proposals
+        EXCEPT ALL
+        SELECT * FROM tentative
+    )
+-- The tentative accepts become real accepts!
+SELECT * FROM tentative
+```
+
+Each of these steps--proposal, tentative acceptance, and rejection--follow the written description up above.
+The behavior of the `WITH MUTUALLY RECURSIVE` block is to evaluate each term in order, then repeat from the top, until they stop changing.
+It's worth a moment reading and maybe re-reading the SQL to convince yourself that there is at least some relationship to the written plan.
+
+If we run the query, we get the result up above.
+```
+ name1 | pref1 | name2 | pref2 
+-------+-------+-------+-------
+ arjun |     3 | sushi |     4
+ frank |     4 | ramen |     1
+(2 rows)
+```
+
+These results are great to see, but we are here to *maintain* computation, as input data change.
+We can also [`SUBSCRIBE`](https://materialize.com/docs/sql/subscribe/) to the query, and then modify the input to see some output changes.
+
+Each subscribe starts with a snapshot, and it should be (and is) the answer just up above.
+```
+1702997600437	 1	arjun	3	sushi	4
+1702997600437	 1	frank	4	ramen	1
+```
+To remind you, or introduce you, `SUBSCRIBE` produces output whose first column is the timestamp of some update event, followed by a change in count (here `1` for both records), followed by payload columns matching what you'd see from a `SELECT` query.
+
+At this point, let's introduce the possibility that Frank would happily eat a sandwich instead of ramen.
+```
+materialize=> insert into prefs values ('frank', 2, 'sando', 3);
+```
+As soon as I press enter, a bunch of changes spill out of the subscription:
+```
+1702997625810	 1	arjun	1	ramen	3
+1702997625810	-1	arjun	3	sushi	4
+1702997625810	 1	frank	2	sando	3
+1702997625810	-1	frank	4	ramen	1
+1702997625810	 1	nikhil	1	sushi	5
+```
+How do we read this? 
+Arjun has a shuffle where he gains a matching with ramen and yields his sushi seat.
+Frank switches to a sandwich from ramen.
+And Nikhil gets lunch! 
+Sushi isn't happy about it, mind you, but lunch occurs for all producers and consumers.
+
+Importantly, there is one timestamp (`1702997625810`), indicating that all five changes happen atomically, at exactly the same moment.
+Neither producer nor consumer will be over-committed, even for a moment, on account of Materialize doesn't screw around with consistency and correctness.
+
+### Generalizing Stable Matching
+
+Let's imagine that each restaurant can serve more than one person, and instead has an integer 'capacity'.
+What do we need to change about our process?
+Let's introduce tables `producer_capacity` and `consumer_capacity`, which each hold a name and an integer capacity.
+
+```sql
+-- Each producer and consumer have an integer number of matches they can participate in.
+CREATE TABLE producer_capacity(name TEXT, cap INT);
+CREATE TABLE consumer_capacity(name TEXT, cap INT);
+```
+
+What we need to tweak about the algorithm is that each producer proposes at their top `cap` opportunities, and each consumer tentatively accepts their top `cap` proposals.
+
+Where above we have fragments that look like so, to pick the top singular opportunity,
+```sql
+    -- Each `name1` 'proposes' to its favorite-est `name2`.
+    proposals(name1 TEXT, pref1 INT, name2 TEXT, pref2 INT) AS (
+        SELECT DISTINCT ON (name1) *
+        FROM active
+        ORDER BY name1, pref1, name2, pref2
+    ),
+```
+we'll want to update these to pick the top `cap` opportunities:
+```sql
+    -- Each `name1` 'proposes' to its `cap` favorite-est `name2`.
+    proposals(name1 TEXT, pref1 INT, name2 TEXT, pref2 INT) AS (
+        SELECT lat.* FROM producer_capacity, 
+        LATERAL (
+            -- pick out the best `cap` opportunities
+            SELECT * FROM active
+            WHERE active.name1 = producer_capacity.name
+            ORDER BY active.pref1
+            LIMIT producer_capacity.cap
+        ) lat
+    ),
+```
+This new SQL is a bit more complicated than the old SQL, but the `LATERAL` join allows us to invoke `LIMIT` with an argument that depends on `cap` rather than a limit of exactly one that `DISTINCT ON` provides.
+
+We'll need to do the same thing for our tentative accepts, using `consumer_capacity`.
+```sql
+    -- Each `name2` tentatively 'accepts' the proposal from its favorite-est `name1`
+    tentative(name1 TEXT, pref1 INT, name2 TEXT, pref2 INT) AS (
+        SELECT lat.* FROM consumer_capacity, 
+        LATERAL (
+            -- pick out the best `cap` proposals
+            SELECT * FROM proposals
+            WHERE proposals.name2 = consumer_capacity.name
+            ORDER BY proposals.pref2
+            LIMIT consumer_capacity.cap
+        ) lat
+    ),
+```
+
+With unit capacities we'll see the same results as before. 
+However, let's introduce Nikhil to ramen, which it turns out he likes.
+```
+materialize=> insert into prefs values ('nikhil', 1, 'ramen', 2);
+```
+This has some immediate consequences for our subscription to the matching.
+I restarted it because we need to pick up the new query with capacities, but the new snapshot put us right back where we were before.
+```
+1703011622743	-1	arjun	1	ramen	3
+1703011622743	 1	arjun	3	sushi	4
+1703011622743	 1	nikhil	1	ramen	2
+1703011622743	-1	nikhil	1	sushi	5
+```
+This dislodges Arjun, who is now back on the sushi plan, because the ramen folks are fully occupied. 
+But only because they are occupied.
+Let's update their capacity to two, which should give Arjun a seat.
+```
+materialize=> update consumer_capacity set cap = 2 where name = 'ramen';
+```
+```
+1703011679155	 1	arjun	1	ramen	3
+1703011679155	-1	arjun	3	sushi	4
+```
+And, to rattle things a bit more let's imagine the sandwich shop is sold out and their capacity drops down to zero.
+```
+materialize=> update consumer_capacity set cap = 0 where name = 'sando';
+```
+```
+1703011883207	-1	arjun	1	ramen	3
+1703011883207	 1	arjun	3	sushi	4
+1703011883207	-1	frank	2	sando	3
+1703011883207	 1	frank	4	ramen	1
+```
+Poor Arjun is just getting bounced around. 
+He decides he really wants some ramen, and offers a cash incentive which updates their preference for him dramatically. 
+We'll model this by just tweaking their preference directly.
+
+```
+materialize=> update prefs set pref2 = 1 where name1 = 'arjun' and name2 = 'ramen';
+```
+```
+1703012011622	 1	arjun	1	ramen	1
+1703012011622	-1	arjun	3	sushi	4
+1703012011622	-1	nikhil	1	ramen	2
+1703012011622	 1	nikhil	1	sushi	5
+```
+And Arjun is back on ramen and Nikhil is back on sushi.
+
+### Recursive SQL and Doing Business
+
+There are lots of changes the input may experience, many of which lead to changed output.
+Like in life, the world changes around you and you may need to promptly update your plans for the world.
+Materialize and recursive SQL are here to make sure you are always looking at the correct output, moment by moment.
+
+We've seen an example of using SQL for one problem that is fundamental in economics: stable matching (with capacities).
+This certainly isn't the only problem in economics, nor even the most significant business problem you'll have, but it does show off a potentially new use of recursive SQL to solve the problem.
+Other problems, similar and different, have natural solutions with recursive SQL that you might not have imagined, and you wouldn't be able to access with vanilla SQL.
+
+<!-- ##{'timestamp':1702962000}## -->。">
+<meta property="og:title" content="Doing Business with Recursive SQL">
+<meta property="og:description" content="
+Let's take a look at a fundamental problem in economics, with applications to doing business: matching up producers and consumers of some abstract resource, in a way that appeals to all of the participants.
+
+Imagine we have a set of producers and a set of consumers, each of whom wants to be matched to one member of the opposite type, and each of them have some (not neccesarily shared) preference for the other.
+The problem was initially presented in the language of 'stable marriage', but it applies to any pairings where the participants have opinions about those they might be paired with.
+The framing has also been applied to matching hospital residents with hospitals, application clients with server capacity, and in this post hungry engineers and their lunching options.
+You should be able to apply it to a variety of settings, most fruitfully when the matched things come with a rich variety of opinions about each other.
+
+To spill the beans, there already is an algorithm for [stable matching](https://en.wikipedia.org/wiki/Stable_marriage_problem), and we're just going to implement it in recursive SQL.
+You might not have thought of SQL as a language for *algorithms*, and conventional SQL is certainly very limited in this respect.
+However, recursive SQL can be a great fit, and when it is there's no reason not to just lean on the existing approaches!
+
+### Stable Matching in SQL
+
+We will work off of a table `prefs` that will store the mutual preferences between pairs of producer and consumer.
+Not every pair needs to be represented here, and any pairs that are absent will just be taken to be non-viable.
+We'll call producers and consumers by `name1` and `name2`, respectively, which aren't very evocative but are easier to type.
+Each pair will have integer preferences `pref1` and `pref2` for each other, where smaller numbers mean higher preference (imaging them as a ranking).
+
+```sql
+-- Each entry indicates a potential connection between `name1` and `name2`.
+-- Each has a numerical preference for this, where we'll take smaller to be better.
+-- The goal is to match up `(name1, name2)` pairs where each prefers the other over
+-- any other 'stable' pairing (someone else who likes them back enough not to leave).
+CREATE TABLE prefs(name1 TEXT, pref1 INT, name2 TEXT, pref2 INT);
+```
+
+Our goal is to pull out a subset of `prefs` where each `name1` and `name2` occur at most once.
+Also, we shouldn't leave behind any pairing in which each prefers the other more than the pair they were assigned.
+That second part is where the algorithm comes in.
+
+Of course, we'll want some example preferences to work with.
+Let's start with some hungry engineers and food options.
+Thematically, let's imagine that each human prefers the foods based on their own unaccountable tastes, and the food options (restaurants) prefer the humans based on their distance (because each's price doesn't vary as a function of the human, but the delivery cost does).
+
+Here's some made up data that will show off what we are trying to do.
+
+```sql
+-- Imagine people have a preference for foods that idk is based on its price.
+-- Imagine restaurants have a preference for people based on their distance.
+INSERT INTO prefs VALUES
+('frank',  4, 'ramen', 1),  -- frank needs food, and ramen likes him best
+('arjun',  1, 'ramen', 3),  -- arjun lovel ramen, but it is unrequited.
+('arjun',  3, 'sushi', 4),  -- arjun can tolerate sushi; they prefer him to nikhil.
+('nikhil', 1, 'sushi', 5);  -- nikhil is too far away to safely enjoy sushi.
+```
+
+If we study the data (and the comments) we will find that one stable matching is 
+```
+ name1 | pref1 | name2 | pref2 
+-------+-------+-------+-------
+ arjun |     3 | sushi |     4
+ frank |     4 | ramen |     1
+(2 rows)
+```
+Nikhil doesn't get lunch in this story, which is too bad, but is a demonstration of the constraints: not everyone gets what they want.
+Arjun also doesn't get what he wants, which is ramen, because it isn't stable: the ramen-ya would just hit Frank up and they'd do lunch instead.
+It turns out there aren't other stable matchings for this data, but in general there can be many.
+
+How do we arrive at a stable matching?
+Fortunately, way back in 1962, [Gale and Shapley proposed](https://web.archive.org/web/20170925172517/http://www.dtic.mil/get-tr-doc/pdf?AD=AD0251958) an algorithm to do just that.
+In one variant: each producer proposes to satisfy their favorite consumer, each consumer definitively rejects all but the best proposal, and spurned proposers repeat with their next best options, until the rejections stop or they run out of options.
+
+It's pretty much recursion, isn't it? 
+And moreover, each of the steps are pretty easy SQL.
+Let's write them down!
+
+```sql
+-- Iteratively develop proposals and rejections.
+WITH MUTUALLY RECURSIVE
+    -- Pairings that have yet not been explicitly rejected.
+    active(name1 TEXT, pref1 INT, name2 TEXT, pref2 INT) AS (
+        SELECT * FROM prefs
+        EXCEPT ALL
+        SELECT * FROM rejects
+    ),
+    -- Each `name1` proposes to its favorite-est `name2`.
+    proposals(name1 TEXT, pref1 INT, name2 TEXT, pref2 INT) AS (
+        SELECT DISTINCT ON (name1) *
+        FROM active
+        ORDER BY name1, pref1, name2, pref2
+    ),
+    -- Each `name2` tentatively accepts the proposal from its favorite-est `name1`
+    tentative(name1 TEXT, pref1 INT, name2 TEXT, pref2 INT) AS (
+        SELECT DISTINCT ON (name2) *
+        FROM proposals
+        ORDER BY name2, pref2, name1, pref1
+    ),
+    -- Proposals that are not accepted become definitively rejected.
+    rejects(name1 TEXT, pref1 INT, name2 TEXT, pref2 INT) AS (
+        SELECT * FROM rejects
+        UNION ALL
+        SELECT * FROM proposals
+        EXCEPT ALL
+        SELECT * FROM tentative
+    )
+-- The tentative accepts become real accepts!
+SELECT * FROM tentative
+```
+
+Each of these steps--proposal, tentative acceptance, and rejection--follow the written description up above.
+The behavior of the `WITH MUTUALLY RECURSIVE` block is to evaluate each term in order, then repeat from the top, until they stop changing.
+It's worth a moment reading and maybe re-reading the SQL to convince yourself that there is at least some relationship to the written plan.
+
+If we run the query, we get the result up above.
+```
+ name1 | pref1 | name2 | pref2 
+-------+-------+-------+-------
+ arjun |     3 | sushi |     4
+ frank |     4 | ramen |     1
+(2 rows)
+```
+
+These results are great to see, but we are here to *maintain* computation, as input data change.
+We can also [`SUBSCRIBE`](https://materialize.com/docs/sql/subscribe/) to the query, and then modify the input to see some output changes.
+
+Each subscribe starts with a snapshot, and it should be (and is) the answer just up above.
+```
+1702997600437	 1	arjun	3	sushi	4
+1702997600437	 1	frank	4	ramen	1
+```
+To remind you, or introduce you, `SUBSCRIBE` produces output whose first column is the timestamp of some update event, followed by a change in count (here `1` for both records), followed by payload columns matching what you'd see from a `SELECT` query.
+
+At this point, let's introduce the possibility that Frank would happily eat a sandwich instead of ramen.
+```
+materialize=> insert into prefs values ('frank', 2, 'sando', 3);
+```
+As soon as I press enter, a bunch of changes spill out of the subscription:
+```
+1702997625810	 1	arjun	1	ramen	3
+1702997625810	-1	arjun	3	sushi	4
+1702997625810	 1	frank	2	sando	3
+1702997625810	-1	frank	4	ramen	1
+1702997625810	 1	nikhil	1	sushi	5
+```
+How do we read this? 
+Arjun has a shuffle where he gains a matching with ramen and yields his sushi seat.
+Frank switches to a sandwich from ramen.
+And Nikhil gets lunch! 
+Sushi isn't happy about it, mind you, but lunch occurs for all producers and consumers.
+
+Importantly, there is one timestamp (`1702997625810`), indicating that all five changes happen atomically, at exactly the same moment.
+Neither producer nor consumer will be over-committed, even for a moment, on account of Materialize doesn't screw around with consistency and correctness.
+
+### Generalizing Stable Matching
+
+Let's imagine that each restaurant can serve more than one person, and instead has an integer 'capacity'.
+What do we need to change about our process?
+Let's introduce tables `producer_capacity` and `consumer_capacity`, which each hold a name and an integer capacity.
+
+```sql
+-- Each producer and consumer have an integer number of matches they can participate in.
+CREATE TABLE producer_capacity(name TEXT, cap INT);
+CREATE TABLE consumer_capacity(name TEXT, cap INT);
+```
+
+What we need to tweak about the algorithm is that each producer proposes at their top `cap` opportunities, and each consumer tentatively accepts their top `cap` proposals.
+
+Where above we have fragments that look like so, to pick the top singular opportunity,
+```sql
+    -- Each `name1` 'proposes' to its favorite-est `name2`.
+    proposals(name1 TEXT, pref1 INT, name2 TEXT, pref2 INT) AS (
+        SELECT DISTINCT ON (name1) *
+        FROM active
+        ORDER BY name1, pref1, name2, pref2
+    ),
+```
+we'll want to update these to pick the top `cap` opportunities:
+```sql
+    -- Each `name1` 'proposes' to its `cap` favorite-est `name2`.
+    proposals(name1 TEXT, pref1 INT, name2 TEXT, pref2 INT) AS (
+        SELECT lat.* FROM producer_capacity, 
+        LATERAL (
+            -- pick out the best `cap` opportunities
+            SELECT * FROM active
+            WHERE active.name1 = producer_capacity.name
+            ORDER BY active.pref1
+            LIMIT producer_capacity.cap
+        ) lat
+    ),
+```
+This new SQL is a bit more complicated than the old SQL, but the `LATERAL` join allows us to invoke `LIMIT` with an argument that depends on `cap` rather than a limit of exactly one that `DISTINCT ON` provides.
+
+We'll need to do the same thing for our tentative accepts, using `consumer_capacity`.
+```sql
+    -- Each `name2` tentatively 'accepts' the proposal from its favorite-est `name1`
+    tentative(name1 TEXT, pref1 INT, name2 TEXT, pref2 INT) AS (
+        SELECT lat.* FROM consumer_capacity, 
+        LATERAL (
+            -- pick out the best `cap` proposals
+            SELECT * FROM proposals
+            WHERE proposals.name2 = consumer_capacity.name
+            ORDER BY proposals.pref2
+            LIMIT consumer_capacity.cap
+        ) lat
+    ),
+```
+
+With unit capacities we'll see the same results as before. 
+However, let's introduce Nikhil to ramen, which it turns out he likes.
+```
+materialize=> insert into prefs values ('nikhil', 1, 'ramen', 2);
+```
+This has some immediate consequences for our subscription to the matching.
+I restarted it because we need to pick up the new query with capacities, but the new snapshot put us right back where we were before.
+```
+1703011622743	-1	arjun	1	ramen	3
+1703011622743	 1	arjun	3	sushi	4
+1703011622743	 1	nikhil	1	ramen	2
+1703011622743	-1	nikhil	1	sushi	5
+```
+This dislodges Arjun, who is now back on the sushi plan, because the ramen folks are fully occupied. 
+But only because they are occupied.
+Let's update their capacity to two, which should give Arjun a seat.
+```
+materialize=> update consumer_capacity set cap = 2 where name = 'ramen';
+```
+```
+1703011679155	 1	arjun	1	ramen	3
+1703011679155	-1	arjun	3	sushi	4
+```
+And, to rattle things a bit more let's imagine the sandwich shop is sold out and their capacity drops down to zero.
+```
+materialize=> update consumer_capacity set cap = 0 where name = 'sando';
+```
+```
+1703011883207	-1	arjun	1	ramen	3
+1703011883207	 1	arjun	3	sushi	4
+1703011883207	-1	frank	2	sando	3
+1703011883207	 1	frank	4	ramen	1
+```
+Poor Arjun is just getting bounced around. 
+He decides he really wants some ramen, and offers a cash incentive which updates their preference for him dramatically. 
+We'll model this by just tweaking their preference directly.
+
+```
+materialize=> update prefs set pref2 = 1 where name1 = 'arjun' and name2 = 'ramen';
+```
+```
+1703012011622	 1	arjun	1	ramen	1
+1703012011622	-1	arjun	3	sushi	4
+1703012011622	-1	nikhil	1	ramen	2
+1703012011622	 1	nikhil	1	sushi	5
+```
+And Arjun is back on ramen and Nikhil is back on sushi.
+
+### Recursive SQL and Doing Business
+
+There are lots of changes the input may experience, many of which lead to changed output.
+Like in life, the world changes around you and you may need to promptly update your plans for the world.
+Materialize and recursive SQL are here to make sure you are always looking at the correct output, moment by moment.
+
+We've seen an example of using SQL for one problem that is fundamental in economics: stable matching (with capacities).
+This certainly isn't the only problem in economics, nor even the most significant business problem you'll have, but it does show off a potentially new use of recursive SQL to solve the problem.
+Other problems, similar and different, have natural solutions with recursive SQL that you might not have imagined, and you wouldn't be able to access with vanilla SQL.
+
+<!-- ##{'timestamp':1702962000}## -->。">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://nuowoo.github.io/blog/post/Doing%20Business%20with%20Recursive%20SQL.html">
+<meta property="og:image" content="https://github.githubassets.com/favicons/favicon.svg">
+<title>Doing Business with Recursive SQL</title>
+<link href="//unpkg.com/@wooorm/starry-night@2.1.1/style/both.css" rel="stylesheet" />
+
+
+</head>
+<style>
+body{box-sizing: border-box;min-width: 200px;max-width: 900px;margin: 20px auto;padding: 45px;font-size: 16px;font-family: sans-serif;line-height: 1.25;}
+#header{display:flex;padding-bottom:8px;border-bottom: 1px solid var(--borderColor-muted, var(--color-border-muted));margin-bottom: 16px;}
+#footer {margin-top:64px; text-align: center;font-size: small;}
+
+</style>
+
+<style>
+.postTitle{margin: auto 0;font-size:40px;font-weight:bold;}
+.title-right{display:flex;margin:auto 0 0 auto;}
+.title-right .circle{padding: 14px 16px;margin-right:8px;}
+#postBody{border-bottom: 1px solid var(--color-border-default);padding-bottom:36px;}
+#postBody hr{height:2px;}
+#cmButton{height:48px;margin-top:48px;}
+#comments{margin-top:64px;}
+.g-emoji{font-size:24px;}
+@media (max-width: 600px) {
+    body {padding: 8px;}
+    .postTitle{font-size:24px;}
+}
+.copy-feedback {
+    display: none;
+    position: absolute;
+    top: 10px;
+    right: 50px;
+    color: var(--color-fg-on-emphasis);
+    background-color: var(--color-fg-muted);
+    border-radius: 3px;
+    padding: 5px 8px;
+    font-size: 12px;
+}
+</style>
+
+
+
+
+<body>
+    <div id="header">
+<h1 class="postTitle">Doing Business with Recursive SQL</h1>
+<div class="title-right">
+    <a href="https://nuowoo.github.io/blog" id="buttonHome" class="btn btn-invisible circle" title="首页">
+        <svg class="octicon" width="16" height="16">
+            <path id="pathHome" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+    
+    <a href="https://github.com/nuowoo/blog/issues/6" target="_blank" class="btn btn-invisible circle" title="Issue">
+        <svg class="octicon" width="16" height="16">
+            <path id="pathIssue" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+    
+
+    <a class="btn btn-invisible circle" onclick="modeSwitch();" title="切换主题">
+        <svg class="octicon" width="16" height="16" >
+            <path id="themeSwitch" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+
+</div>
+</div>
+    <div id="content">
+<div class="markdown-body" id="postBody"><p>Let's take a look at a fundamental problem in economics, with applications to doing business: matching up producers and consumers of some abstract resource, in a way that appeals to all of the participants.</p>
+<p>Imagine we have a set of producers and a set of consumers, each of whom wants to be matched to one member of the opposite type, and each of them have some (not neccesarily shared) preference for the other.<br>
+The problem was initially presented in the language of "stable marriage", but it applies to any pairings where the participants have opinions about those they might be paired with.<br>
+The framing has also been applied to matching hospital residents with hospitals, application clients with server capacity, and in this post hungry engineers and their lunching options.<br>
+You should be able to apply it to a variety of settings, most fruitfully when the matched things come with a rich variety of opinions about each other.</p>
+<p>To spill the beans, there already is an algorithm for <a href="https://en.wikipedia.org/wiki/Stable_marriage_problem" rel="nofollow">stable matching</a>, and we're just going to implement it in recursive SQL.<br>
+You might not have thought of SQL as a language for <em>algorithms</em>, and conventional SQL is certainly very limited in this respect.<br>
+However, recursive SQL can be a great fit, and when it is there's no reason not to just lean on the existing approaches!</p>
+<h3>Stable Matching in SQL</h3>
+<p>We will work off of a table <code class="notranslate">prefs</code> that will store the mutual preferences between pairs of producer and consumer.<br>
+Not every pair needs to be represented here, and any pairs that are absent will just be taken to be non-viable.<br>
+We'll call producers and consumers by <code class="notranslate">name1</code> and <code class="notranslate">name2</code>, respectively, which aren't very evocative but are easier to type.<br>
+Each pair will have integer preferences <code class="notranslate">pref1</code> and <code class="notranslate">pref2</code> for each other, where smaller numbers mean higher preference (imaging them as a ranking).</p>
+<div class="highlight highlight-source-sql"><pre class="notranslate"><span class="pl-c"><span class="pl-c">--</span> Each entry indicates a potential connection between `name1` and `name2`.</span>
+<span class="pl-c"><span class="pl-c">--</span> Each has a numerical preference for this, where we'll take smaller to be better.</span>
+<span class="pl-c"><span class="pl-c">--</span> The goal is to match up `(name1, name2)` pairs where each prefers the other over</span>
+<span class="pl-c"><span class="pl-c">--</span> any other "stable" pairing (someone else who likes them back enough not to leave).</span>
+<span class="pl-k">CREATE</span> <span class="pl-k">TABLE</span> <span class="pl-en">prefs</span>(name1 <span class="pl-k">TEXT</span>, pref1 <span class="pl-k">INT</span>, name2 <span class="pl-k">TEXT</span>, pref2 <span class="pl-k">INT</span>);</pre></div>
+<p>Our goal is to pull out a subset of <code class="notranslate">prefs</code> where each <code class="notranslate">name1</code> and <code class="notranslate">name2</code> occur at most once.<br>
+Also, we shouldn't leave behind any pairing in which each prefers the other more than the pair they were assigned.<br>
+That second part is where the algorithm comes in.</p>
+<p>Of course, we'll want some example preferences to work with.<br>
+Let's start with some hungry engineers and food options.<br>
+Thematically, let's imagine that each human prefers the foods based on their own unaccountable tastes, and the food options (restaurants) prefer the humans based on their distance (because each's price doesn't vary as a function of the human, but the delivery cost does).</p>
+<p>Here's some made up data that will show off what we are trying to do.</p>
+<div class="highlight highlight-source-sql"><pre class="notranslate"><span class="pl-c"><span class="pl-c">--</span> Imagine people have a preference for foods that idk is based on its price.</span>
+<span class="pl-c"><span class="pl-c">--</span> Imagine restaurants have a preference for people based on their distance.</span>
+<span class="pl-k">INSERT INTO</span> prefs <span class="pl-k">VALUES</span>
+(<span class="pl-s"><span class="pl-pds">'</span>frank<span class="pl-pds">'</span></span>,  <span class="pl-c1">4</span>, <span class="pl-s"><span class="pl-pds">'</span>ramen<span class="pl-pds">'</span></span>, <span class="pl-c1">1</span>),  <span class="pl-c"><span class="pl-c">--</span> frank needs food, and ramen likes him best</span>
+(<span class="pl-s"><span class="pl-pds">'</span>arjun<span class="pl-pds">'</span></span>,  <span class="pl-c1">1</span>, <span class="pl-s"><span class="pl-pds">'</span>ramen<span class="pl-pds">'</span></span>, <span class="pl-c1">3</span>),  <span class="pl-c"><span class="pl-c">--</span> arjun lovel ramen, but it is unrequited.</span>
+(<span class="pl-s"><span class="pl-pds">'</span>arjun<span class="pl-pds">'</span></span>,  <span class="pl-c1">3</span>, <span class="pl-s"><span class="pl-pds">'</span>sushi<span class="pl-pds">'</span></span>, <span class="pl-c1">4</span>),  <span class="pl-c"><span class="pl-c">--</span> arjun can tolerate sushi; they prefer him to nikhil.</span>
+(<span class="pl-s"><span class="pl-pds">'</span>nikhil<span class="pl-pds">'</span></span>, <span class="pl-c1">1</span>, <span class="pl-s"><span class="pl-pds">'</span>sushi<span class="pl-pds">'</span></span>, <span class="pl-c1">5</span>);  <span class="pl-c"><span class="pl-c">--</span> nikhil is too far away to safely enjoy sushi.</span></pre></div>
+<p>If we study the data (and the comments) we will find that one stable matching is</p>
+<pre class="notranslate"><code class="notranslate"> name1 | pref1 | name2 | pref2 
+-------+-------+-------+-------
+ arjun |     3 | sushi |     4
+ frank |     4 | ramen |     1
+(2 rows)
+</code></pre>
+<p>Nikhil doesn't get lunch in this story, which is too bad, but is a demonstration of the constraints: not everyone gets what they want.<br>
+Arjun also doesn't get what he wants, which is ramen, because it isn't stable: the ramen-ya would just hit Frank up and they'd do lunch instead.<br>
+It turns out there aren't other stable matchings for this data, but in general there can be many.</p>
+<p>How do we arrive at a stable matching?<br>
+Fortunately, way back in 1962, <a href="https://web.archive.org/web/20170925172517/http://www.dtic.mil/get-tr-doc/pdf?AD=AD0251958" rel="nofollow">Gale and Shapley proposed</a> an algorithm to do just that.<br>
+In one variant: each producer proposes to satisfy their favorite consumer, each consumer definitively rejects all but the best proposal, and spurned proposers repeat with their next best options, until the rejections stop or they run out of options.</p>
+<p>It's pretty much recursion, isn't it?<br>
+And moreover, each of the steps are pretty easy SQL.<br>
+Let's write them down!</p>
+<div class="highlight highlight-source-sql"><pre class="notranslate"><span class="pl-c"><span class="pl-c">--</span> Iteratively develop proposals and rejections.</span>
+WITH MUTUALLY RECURSIVE
+    <span class="pl-c"><span class="pl-c">--</span> Pairings that have yet not been explicitly rejected.</span>
+    active(name1 <span class="pl-k">TEXT</span>, pref1 <span class="pl-k">INT</span>, name2 <span class="pl-k">TEXT</span>, pref2 <span class="pl-k">INT</span>) <span class="pl-k">AS</span> (
+        <span class="pl-k">SELECT</span> <span class="pl-k">*</span> <span class="pl-k">FROM</span> prefs
+        EXCEPT ALL
+        <span class="pl-k">SELECT</span> <span class="pl-k">*</span> <span class="pl-k">FROM</span> rejects
+    ),
+    <span class="pl-c"><span class="pl-c">--</span> Each `name1` proposes to its favorite-est `name2`.</span>
+    proposals(name1 <span class="pl-k">TEXT</span>, pref1 <span class="pl-k">INT</span>, name2 <span class="pl-k">TEXT</span>, pref2 <span class="pl-k">INT</span>) <span class="pl-k">AS</span> (
+        <span class="pl-k">SELECT DISTINCT</span> <span class="pl-k">ON</span> (name1) <span class="pl-k">*</span>
+        <span class="pl-k">FROM</span> active
+        <span class="pl-k">ORDER BY</span> name1, pref1, name2, pref2
+    ),
+    <span class="pl-c"><span class="pl-c">--</span> Each `name2` tentatively accepts the proposal from its favorite-est `name1`</span>
+    tentative(name1 <span class="pl-k">TEXT</span>, pref1 <span class="pl-k">INT</span>, name2 <span class="pl-k">TEXT</span>, pref2 <span class="pl-k">INT</span>) <span class="pl-k">AS</span> (
+        <span class="pl-k">SELECT DISTINCT</span> <span class="pl-k">ON</span> (name2) <span class="pl-k">*</span>
+        <span class="pl-k">FROM</span> proposals
+        <span class="pl-k">ORDER BY</span> name2, pref2, name1, pref1
+    ),
+    <span class="pl-c"><span class="pl-c">--</span> Proposals that are not accepted become definitively rejected.</span>
+    rejects(name1 <span class="pl-k">TEXT</span>, pref1 <span class="pl-k">INT</span>, name2 <span class="pl-k">TEXT</span>, pref2 <span class="pl-k">INT</span>) <span class="pl-k">AS</span> (
+        <span class="pl-k">SELECT</span> <span class="pl-k">*</span> <span class="pl-k">FROM</span> rejects
+        <span class="pl-k">UNION ALL</span>
+        <span class="pl-k">SELECT</span> <span class="pl-k">*</span> <span class="pl-k">FROM</span> proposals
+        EXCEPT ALL
+        <span class="pl-k">SELECT</span> <span class="pl-k">*</span> <span class="pl-k">FROM</span> tentative
+    )
+<span class="pl-c"><span class="pl-c">--</span> The tentative accepts become real accepts!</span>
+<span class="pl-k">SELECT</span> <span class="pl-k">*</span> <span class="pl-k">FROM</span> tentative</pre></div>
+<p>Each of these steps--proposal, tentative acceptance, and rejection--follow the written description up above.<br>
+The behavior of the <code class="notranslate">WITH MUTUALLY RECURSIVE</code> block is to evaluate each term in order, then repeat from the top, until they stop changing.<br>
+It's worth a moment reading and maybe re-reading the SQL to convince yourself that there is at least some relationship to the written plan.</p>
+<p>If we run the query, we get the result up above.</p>
+<pre class="notranslate"><code class="notranslate"> name1 | pref1 | name2 | pref2 
+-------+-------+-------+-------
+ arjun |     3 | sushi |     4
+ frank |     4 | ramen |     1
+(2 rows)
+</code></pre>
+<p>These results are great to see, but we are here to <em>maintain</em> computation, as input data change.<br>
+We can also <a href="https://materialize.com/docs/sql/subscribe/" rel="nofollow"><code class="notranslate">SUBSCRIBE</code></a> to the query, and then modify the input to see some output changes.</p>
+<p>Each subscribe starts with a snapshot, and it should be (and is) the answer just up above.</p>
+<pre class="notranslate"><code class="notranslate">1702997600437	 1	arjun	3	sushi	4
+1702997600437	 1	frank	4	ramen	1
+</code></pre>
+<p>To remind you, or introduce you, <code class="notranslate">SUBSCRIBE</code> produces output whose first column is the timestamp of some update event, followed by a change in count (here <code class="notranslate">1</code> for both records), followed by payload columns matching what you'd see from a <code class="notranslate">SELECT</code> query.</p>
+<p>At this point, let's introduce the possibility that Frank would happily eat a sandwich instead of ramen.</p>
+<pre class="notranslate"><code class="notranslate">materialize=&gt; insert into prefs values ('frank', 2, 'sando', 3);
+</code></pre>
+<p>As soon as I press enter, a bunch of changes spill out of the subscription:</p>
+<pre class="notranslate"><code class="notranslate">1702997625810	 1	arjun	1	ramen	3
+1702997625810	-1	arjun	3	sushi	4
+1702997625810	 1	frank	2	sando	3
+1702997625810	-1	frank	4	ramen	1
+1702997625810	 1	nikhil	1	sushi	5
+</code></pre>
+<p>How do we read this?<br>
+Arjun has a shuffle where he gains a matching with ramen and yields his sushi seat.<br>
+Frank switches to a sandwich from ramen.<br>
+And Nikhil gets lunch!<br>
+Sushi isn't happy about it, mind you, but lunch occurs for all producers and consumers.</p>
+<p>Importantly, there is one timestamp (<code class="notranslate">1702997625810</code>), indicating that all five changes happen atomically, at exactly the same moment.<br>
+Neither producer nor consumer will be over-committed, even for a moment, on account of Materialize doesn't screw around with consistency and correctness.</p>
+<h3>Generalizing Stable Matching</h3>
+<p>Let's imagine that each restaurant can serve more than one person, and instead has an integer "capacity".<br>
+What do we need to change about our process?<br>
+Let's introduce tables <code class="notranslate">producer_capacity</code> and <code class="notranslate">consumer_capacity</code>, which each hold a name and an integer capacity.</p>
+<div class="highlight highlight-source-sql"><pre class="notranslate"><span class="pl-c"><span class="pl-c">--</span> Each producer and consumer have an integer number of matches they can participate in.</span>
+<span class="pl-k">CREATE</span> <span class="pl-k">TABLE</span> <span class="pl-en">producer_capacity</span>(name <span class="pl-k">TEXT</span>, cap <span class="pl-k">INT</span>);
+<span class="pl-k">CREATE</span> <span class="pl-k">TABLE</span> <span class="pl-en">consumer_capacity</span>(name <span class="pl-k">TEXT</span>, cap <span class="pl-k">INT</span>);</pre></div>
+<p>What we need to tweak about the algorithm is that each producer proposes at their top <code class="notranslate">cap</code> opportunities, and each consumer tentatively accepts their top <code class="notranslate">cap</code> proposals.</p>
+<p>Where above we have fragments that look like so, to pick the top singular opportunity,</p>
+<div class="highlight highlight-source-sql"><pre class="notranslate">    <span class="pl-c"><span class="pl-c">--</span> Each `name1` "proposes" to its favorite-est `name2`.</span>
+    proposals(name1 <span class="pl-k">TEXT</span>, pref1 <span class="pl-k">INT</span>, name2 <span class="pl-k">TEXT</span>, pref2 <span class="pl-k">INT</span>) <span class="pl-k">AS</span> (
+        <span class="pl-k">SELECT DISTINCT</span> <span class="pl-k">ON</span> (name1) <span class="pl-k">*</span>
+        <span class="pl-k">FROM</span> active
+        <span class="pl-k">ORDER BY</span> name1, pref1, name2, pref2
+    ),</pre></div>
+<p>we'll want to update these to pick the top <code class="notranslate">cap</code> opportunities:</p>
+<div class="highlight highlight-source-sql"><pre class="notranslate">    <span class="pl-c"><span class="pl-c">--</span> Each `name1` "proposes" to its `cap` favorite-est `name2`.</span>
+    proposals(name1 <span class="pl-k">TEXT</span>, pref1 <span class="pl-k">INT</span>, name2 <span class="pl-k">TEXT</span>, pref2 <span class="pl-k">INT</span>) <span class="pl-k">AS</span> (
+        <span class="pl-k">SELECT</span> lat.<span class="pl-k">*</span> <span class="pl-k">FROM</span> producer_capacity, 
+        LATERAL (
+            <span class="pl-c"><span class="pl-c">--</span> pick out the best `cap` opportunities</span>
+            <span class="pl-k">SELECT</span> <span class="pl-k">*</span> <span class="pl-k">FROM</span> active
+            <span class="pl-k">WHERE</span> <span class="pl-c1">active</span>.<span class="pl-c1">name1</span> <span class="pl-k">=</span> <span class="pl-c1">producer_capacity</span>.<span class="pl-c1">name</span>
+            <span class="pl-k">ORDER BY</span> <span class="pl-c1">active</span>.<span class="pl-c1">pref1</span>
+            <span class="pl-k">LIMIT</span> <span class="pl-c1">producer_capacity</span>.<span class="pl-c1">cap</span>
+        ) lat
+    ),</pre></div>
+<p>This new SQL is a bit more complicated than the old SQL, but the <code class="notranslate">LATERAL</code> join allows us to invoke <code class="notranslate">LIMIT</code> with an argument that depends on <code class="notranslate">cap</code> rather than a limit of exactly one that <code class="notranslate">DISTINCT ON</code> provides.</p>
+<p>We'll need to do the same thing for our tentative accepts, using <code class="notranslate">consumer_capacity</code>.</p>
+<div class="highlight highlight-source-sql"><pre class="notranslate">    <span class="pl-c"><span class="pl-c">--</span> Each `name2` tentatively "accepts" the proposal from its favorite-est `name1`</span>
+    tentative(name1 <span class="pl-k">TEXT</span>, pref1 <span class="pl-k">INT</span>, name2 <span class="pl-k">TEXT</span>, pref2 <span class="pl-k">INT</span>) <span class="pl-k">AS</span> (
+        <span class="pl-k">SELECT</span> lat.<span class="pl-k">*</span> <span class="pl-k">FROM</span> consumer_capacity, 
+        LATERAL (
+            <span class="pl-c"><span class="pl-c">--</span> pick out the best `cap` proposals</span>
+            <span class="pl-k">SELECT</span> <span class="pl-k">*</span> <span class="pl-k">FROM</span> proposals
+            <span class="pl-k">WHERE</span> <span class="pl-c1">proposals</span>.<span class="pl-c1">name2</span> <span class="pl-k">=</span> <span class="pl-c1">consumer_capacity</span>.<span class="pl-c1">name</span>
+            <span class="pl-k">ORDER BY</span> <span class="pl-c1">proposals</span>.<span class="pl-c1">pref2</span>
+            <span class="pl-k">LIMIT</span> <span class="pl-c1">consumer_capacity</span>.<span class="pl-c1">cap</span>
+        ) lat
+    ),</pre></div>
+<p>With unit capacities we'll see the same results as before.<br>
+However, let's introduce Nikhil to ramen, which it turns out he likes.</p>
+<pre class="notranslate"><code class="notranslate">materialize=&gt; insert into prefs values ('nikhil', 1, 'ramen', 2);
+</code></pre>
+<p>This has some immediate consequences for our subscription to the matching.<br>
+I restarted it because we need to pick up the new query with capacities, but the new snapshot put us right back where we were before.</p>
+<pre class="notranslate"><code class="notranslate">1703011622743	-1	arjun	1	ramen	3
+1703011622743	 1	arjun	3	sushi	4
+1703011622743	 1	nikhil	1	ramen	2
+1703011622743	-1	nikhil	1	sushi	5
+</code></pre>
+<p>This dislodges Arjun, who is now back on the sushi plan, because the ramen folks are fully occupied.<br>
+But only because they are occupied.<br>
+Let's update their capacity to two, which should give Arjun a seat.</p>
+<pre class="notranslate"><code class="notranslate">materialize=&gt; update consumer_capacity set cap = 2 where name = 'ramen';
+</code></pre>
+<pre class="notranslate"><code class="notranslate">1703011679155	 1	arjun	1	ramen	3
+1703011679155	-1	arjun	3	sushi	4
+</code></pre>
+<p>And, to rattle things a bit more let's imagine the sandwich shop is sold out and their capacity drops down to zero.</p>
+<pre class="notranslate"><code class="notranslate">materialize=&gt; update consumer_capacity set cap = 0 where name = 'sando';
+</code></pre>
+<pre class="notranslate"><code class="notranslate">1703011883207	-1	arjun	1	ramen	3
+1703011883207	 1	arjun	3	sushi	4
+1703011883207	-1	frank	2	sando	3
+1703011883207	 1	frank	4	ramen	1
+</code></pre>
+<p>Poor Arjun is just getting bounced around.<br>
+He decides he really wants some ramen, and offers a cash incentive which updates their preference for him dramatically.<br>
+We'll model this by just tweaking their preference directly.</p>
+<pre class="notranslate"><code class="notranslate">materialize=&gt; update prefs set pref2 = 1 where name1 = 'arjun' and name2 = 'ramen';
+</code></pre>
+<pre class="notranslate"><code class="notranslate">1703012011622	 1	arjun	1	ramen	1
+1703012011622	-1	arjun	3	sushi	4
+1703012011622	-1	nikhil	1	ramen	2
+1703012011622	 1	nikhil	1	sushi	5
+</code></pre>
+<p>And Arjun is back on ramen and Nikhil is back on sushi.</p>
+<h3>Recursive SQL and Doing Business</h3>
+<p>There are lots of changes the input may experience, many of which lead to changed output.<br>
+Like in life, the world changes around you and you may need to promptly update your plans for the world.<br>
+Materialize and recursive SQL are here to make sure you are always looking at the correct output, moment by moment.</p>
+<p>We've seen an example of using SQL for one problem that is fundamental in economics: stable matching (with capacities).<br>
+This certainly isn't the only problem in economics, nor even the most significant business problem you'll have, but it does show off a potentially new use of recursive SQL to solve the problem.<br>
+Other problems, similar and different, have natural solutions with recursive SQL that you might not have imagined, and you wouldn't be able to access with vanilla SQL.</p>
+</div>
+<div style="font-size:small;margin-top:8px;float:right;"></div>
+
+<button class="btn btn-block" type="button" onclick="openComments()" id="cmButton">评论</button>
+<div class="comments" id="comments"></div>
+
+</div>
+    <div id="footer"><div id="footer1">Copyright © <span id="copyrightYear"></span> <a href="https://nuowoo.github.io/blog">Computer Scientist</a></div>
+<div id="footer2">
+    <span id="runday"></span><span>Powered by <a href="https://meekdai.com/Gmeek.html" target="_blank">Gmeek</a></span>
+</div>
+
+<script>
+var now=new Date();
+document.getElementById("copyrightYear").innerHTML=now.getFullYear();
+
+if(""!=""){
+    var startSite=new Date("");
+    var diff=now.getTime()-startSite.getTime();
+    var diffDay=Math.floor(diff/(1000*60*60*24));
+    document.getElementById("runday").innerHTML="网站运行"+diffDay+"天"+" • ";
+}
+</script></div>
+</body>
+<script>
+var IconList={'sun': 'M8 10.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5zM8 12a4 4 0 100-8 4 4 0 000 8zM8 0a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0V.75A.75.75 0 018 0zm0 13a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0v-1.5A.75.75 0 018 13zM2.343 2.343a.75.75 0 011.061 0l1.06 1.061a.75.75 0 01-1.06 1.06l-1.06-1.06a.75.75 0 010-1.06zm9.193 9.193a.75.75 0 011.06 0l1.061 1.06a.75.75 0 01-1.06 1.061l-1.061-1.06a.75.75 0 010-1.061zM16 8a.75.75 0 01-.75.75h-1.5a.75.75 0 010-1.5h1.5A.75.75 0 0116 8zM3 8a.75.75 0 01-.75.75H.75a.75.75 0 010-1.5h1.5A.75.75 0 013 8zm10.657-5.657a.75.75 0 010 1.061l-1.061 1.06a.75.75 0 11-1.06-1.06l1.06-1.06a.75.75 0 011.06 0zm-9.193 9.193a.75.75 0 010 1.06l-1.06 1.061a.75.75 0 11-1.061-1.06l1.06-1.061a.75.75 0 011.061 0z', 'moon': 'M9.598 1.591a.75.75 0 01.785-.175 7 7 0 11-8.967 8.967.75.75 0 01.961-.96 5.5 5.5 0 007.046-7.046.75.75 0 01.175-.786zm1.616 1.945a7 7 0 01-7.678 7.678 5.5 5.5 0 107.678-7.678z', 'sync': 'M1.705 8.005a.75.75 0 0 1 .834.656 5.5 5.5 0 0 0 9.592 2.97l-1.204-1.204a.25.25 0 0 1 .177-.427h3.646a.25.25 0 0 1 .25.25v3.646a.25.25 0 0 1-.427.177l-1.38-1.38A7.002 7.002 0 0 1 1.05 8.84a.75.75 0 0 1 .656-.834ZM8 2.5a5.487 5.487 0 0 0-4.131 1.869l1.204 1.204A.25.25 0 0 1 4.896 6H1.25A.25.25 0 0 1 1 5.75V2.104a.25.25 0 0 1 .427-.177l1.38 1.38A7.002 7.002 0 0 1 14.95 7.16a.75.75 0 0 1-1.49.178A5.5 5.5 0 0 0 8 2.5Z', 'home': 'M6.906.664a1.749 1.749 0 0 1 2.187 0l5.25 4.2c.415.332.657.835.657 1.367v7.019A1.75 1.75 0 0 1 13.25 15h-3.5a.75.75 0 0 1-.75-.75V9H7v5.25a.75.75 0 0 1-.75.75h-3.5A1.75 1.75 0 0 1 1 13.25V6.23c0-.531.242-1.034.657-1.366l5.25-4.2Zm1.25 1.171a.25.25 0 0 0-.312 0l-5.25 4.2a.25.25 0 0 0-.094.196v7.019c0 .138.112.25.25.25H5.5V8.25a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 .75.75v5.25h2.75a.25.25 0 0 0 .25-.25V6.23a.25.25 0 0 0-.094-.195Z', 'github': 'M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z', 'copy': 'M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z', 'check': 'M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z'};
+var utterancesLoad=0;
+
+let themeSettings={
+    "dark": ["dark","moon","#00f0ff","dark-blue"],
+    "light": ["light","sun","#ff5000","github-light"],
+    "auto": ["auto","sync","","preferred-color-scheme"]
+};
+function changeTheme(mode, icon, color, utheme){
+    document.documentElement.setAttribute("data-color-mode",mode);
+    document.getElementById("themeSwitch").setAttribute("d",value=IconList[icon]);
+    document.getElementById("themeSwitch").parentNode.style.color=color;
+    if(utterancesLoad==1){utterancesTheme(utheme);}
+}
+function modeSwitch(){
+    let currentMode=document.documentElement.getAttribute('data-color-mode');
+    let newMode = currentMode === "light" ? "dark" : currentMode === "dark" ? "auto" : "light";
+    localStorage.setItem("meek_theme", newMode);
+    if(themeSettings[newMode]){
+        changeTheme(...themeSettings[newMode]);
+    }
+}
+function utterancesTheme(theme){
+    const message={type:'set-theme',theme: theme};
+    const iframe=document.getElementsByClassName('utterances-frame')[0];
+    iframe.contentWindow.postMessage(message,'https://utteranc.es');
+}
+if(themeSettings[theme]){changeTheme(...themeSettings[theme]);}
+console.log("\n %c Gmeek last https://github.com/Meekdai/Gmeek \n","padding:5px 0;background:#02d81d;color:#fff");
+</script>
+
+<script>
+document.getElementById("pathHome").setAttribute("d",IconList["home"]);
+document.getElementById("pathIssue").setAttribute("d",IconList["github"]);
+
+
+
+function openComments(){
+    cm=document.getElementById("comments");
+    cmButton=document.getElementById("cmButton");
+    cmButton.innerHTML="loading";
+    span=document.createElement("span");
+    span.setAttribute("class","AnimatedEllipsis");
+    cmButton.appendChild(span);
+
+    script=document.createElement("script");
+    script.setAttribute("src","https://utteranc.es/client.js");
+    script.setAttribute("repo","nuowoo/blog");
+    script.setAttribute("issue-term","title");
+    
+    if(localStorage.getItem("meek_theme")=="dark"){script.setAttribute("theme","dark-blue");}
+    else if(localStorage.getItem("meek_theme")=="light") {script.setAttribute("theme","github-light");}
+    else{script.setAttribute("theme","preferred-color-scheme");}
+    
+    script.setAttribute("crossorigin","anonymous");
+    script.setAttribute("async","");
+    cm.appendChild(script);
+
+    int=self.setInterval("iFrameLoading()",200);
+}
+
+function iFrameLoading(){
+    var utterances=document.getElementsByClassName('utterances');
+    if(utterances.length==1){
+        if(utterances[0].style.height!=""){
+            utterancesLoad=1;
+            int=window.clearInterval(int);
+            document.getElementById("cmButton").style.display="none";
+            console.log("utterances Load OK");
+        }
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const createClipboardHTML = (codeContent, additionalClasses = '') => `
+        <pre class="notranslate"><code class="notranslate">${codeContent}</code></pre>
+        <div class="clipboard-container position-absolute right-0 top-0 ${additionalClasses}">
+            <clipboard-copy class="ClipboardButton btn m-2 p-0" role="button" style="display: inherit;">
+                <svg height="16" width="16" class="octicon octicon-copy m-2"><path d="${IconList["copy"]}"></path></svg>
+                <svg height="16" width="16" class="octicon octicon-check color-fg-success m-2 d-none"><path d="${IconList["check"]}"></path></svg>
+            </clipboard-copy>
+            <div class="copy-feedback">Copied!</div>
+        </div>
+    `;
+
+    const handleCodeElements = (selector = '') => {
+        document.querySelectorAll(selector).forEach(codeElement => {
+            const codeContent = codeElement.innerHTML;
+            const newStructure = document.createElement('div');
+            newStructure.className = 'snippet-clipboard-content position-relative overflow-auto';
+            newStructure.innerHTML = createClipboardHTML(codeContent);
+
+            const parentElement = codeElement.parentElement;
+            if (selector.includes('highlight')) {
+                parentElement.insertBefore(newStructure, codeElement.nextSibling);
+                parentElement.removeChild(codeElement);
+            } else {
+                parentElement.parentElement.replaceChild(newStructure, parentElement);
+            }
+        });
+    };
+
+    handleCodeElements('pre.notranslate > code.notranslate');
+    handleCodeElements('div.highlight > pre.notranslate');
+
+    let currentFeedback = null;
+    document.querySelectorAll('clipboard-copy').forEach(copyButton => {
+        copyButton.addEventListener('click', () => {
+            const codeContent = copyButton.closest('.snippet-clipboard-content').innerText;
+            const tempTextArea = document.createElement('textarea');
+            tempTextArea.value = codeContent;
+            document.body.appendChild(tempTextArea);
+            tempTextArea.select();
+            document.execCommand('copy');
+            document.body.removeChild(tempTextArea);
+
+            const copyIcon = copyButton.querySelector('.octicon-copy');
+            const checkIcon = copyButton.querySelector('.octicon-check');
+            const copyFeedback = copyButton.nextElementSibling;
+
+            if (currentFeedback && currentFeedback !== copyFeedback) {currentFeedback.style.display = 'none';}
+            currentFeedback = copyFeedback;
+
+            copyIcon.classList.add('d-none');
+            checkIcon.classList.remove('d-none');
+            copyFeedback.style.display = 'block';
+            copyButton.style.borderColor = 'var(--color-success-fg)';
+
+            setTimeout(() => {
+                copyIcon.classList.remove('d-none');
+                checkIcon.classList.add('d-none');
+                copyFeedback.style.display = 'none';
+                copyButton.style.borderColor = '';
+            }, 2000);
+        });
+    });
+});
+
+</script>
+
+
+</html>

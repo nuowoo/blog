@@ -1,0 +1,830 @@
+<!DOCTYPE html>
+<html data-color-mode="light" data-dark-theme="dark" data-light-theme="light" lang="zh-CN">
+<head>
+    <meta content="text/html; charset=utf-8" http-equiv="content-type" />
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <link href='https://mirrors.sustech.edu.cn/cdnjs/ajax/libs/Primer/21.0.7/primer.css' rel='stylesheet' />
+    <script src='https://blog.meekdai.com/Gmeek/plugins/GmeekVercount.js'></script>,<script type='text/javascript' src='https://udbaa.com/bnr.php?section=GeneralA&pub=847466&format=728x90&ga=g'></script>
+    <link rel="icon" href="https://github.githubassets.com/favicons/favicon.svg"><script>
+        let theme = localStorage.getItem("meek_theme") || "light";
+        document.documentElement.setAttribute("data-color-mode", theme);
+    </script>
+<meta name="description" content="Materialize keeps your SQL views up to date as the underlying data change.
+The value Materialize provides comes from how promptly it reflects new data, but its *cost* comes from the computer resources needed to achieve this.
+While we often talk about the value Materialize provides, and work continually to improve it, we are also hard at work continually reducing the cost.
+This work has had marked impact recently, and it felt like a great time to tell you about it, and the reductions in cost. 
+
+Materialize maintains your source and derived data (e.g. any materialized view), durably in economical cloud storage.
+However, to promptly maintain views and serve results we want to use much more immediately accessible storage.
+This storage, memory or as we'll see soon local disk, acts as a cache that must be fast, but needn't be durable.
+And of course, we would all like it to be as economical as possible.
+
+We've been dialing down the amount of 'overhead' associated with each intermediate maintained record in Materialize.
+We started some months ago at roughly 96 bytes of overhead (we will explain why), and we are now closing in on between 0 and 16 bytes of overhead, depending.
+This first wave of results have already seen many users memory requirements reduced by nearly 2x.
+Moreover, we've laid the groundwork for further improvements, through techniques like spill-to-disk, columnar layout, and compression.
+This further work comes at the cost of CPU cycles, but for the moment CPU cycles are abundant (and elastic) in a way that bytes of memory are not.
+
+In this post we'll map out where we started, detail the relatively simple steps we've taken to effectively reduce the overhead, and sketch the future we've opened up with some help from Rust.
+
+### The Fundemantals of Remembered Things
+
+Materialize models all data as relational rows, each of which has some number of columns, each of which contains one of a few different types of data.
+Over time the rows come and go, each changing their multiplicity through what we call 'updates': triples `(data, time, diff)`.
+Each update indicates a row `data` that at some moment `time` experiences a change `diff` in its multiplicity.
+These changes are often `+1` (insertion) or `-1` (deletion), or a mix of two or more (updates).
+
+Materialize maintains *indexed state* by viewing each `data` as a pair `(key, val)`, where `key` are some signified columns and `val` the remaining columns.
+When you create an index on a collection of data, you specify columns by which you hope to access the data; those columns define `key` and `val` for each `data`.
+We regularly want to fetch the history of some `key`: the associated `val`s and the `(time, diff)` changes they have undergone.
+
+The abstract data type we use maps from `key` to `val` to a list of `(time, diff)` pairs.
+In Rust you might use the `HashMap` type to support this abstraction:
+```rust
+/// Map from key, to value, to a list of times and differences.
+type Indexed<K, V, T, D> = HashMap<K, HashMap<V, Vec<(T, D)>>>;
+```
+
+For various reasons we won't actually want to use `HashMap` itself, and instead prefer other data structures that provide different performance characteristics.
+For example, we are interested in minimizing the number and size of allocations, and optimizing for both random and sequential read and write throughput.
+
+### A First Evolution, circa many years ago
+
+Differential dataflow's fundamental data structures are thusfar based on sorted lists.
+All of differential dataflow's historical performance, which has been pretty solid, has been based on [the perhaps surprising efficiency of sorted memory access](https://github.com/frankmcsherry/blog/blob/master/posts/2015-08-15.md).
+You may have thought we were going to impress you with exotic improvements on Rust's `HashMap` implementation, but we are going to stay with sorted lists.
+
+In the context of space efficiency, sorted lists have a compelling property that Rust's `HashMap` does not have: you can append multiple sorted lists into one larger list, and only need to record the boundaries between them.
+This reduces the per-key, and per-value overhead to something as small as an integer.
+You do miss out on some random access performance, but you also gain on sequential access performance.
+For the moment though, we're interested in space efficiency.
+
+To store the map from `key` to `val` to list of `(time, diff)` updates, differential dataflow uses roughly three vectors:
+```rust
+/// Simplification, for clarity.
+struct Indexed<K, V, T, D> {
+    /// key, and the start of its sorted run in `self.vals`.
+    keys: Vec<(K, usize)>,
+    /// val, and the start of its sorted run in `self.upds`.
+    vals: Vec<(V, usize)>,
+    /// lots and lots of updates.
+    upds: Vec<(T, D)>,
+}
+```
+
+Each key is present once, in sorted order. 
+The `usize` offset for each key tells you where to start in the `vals` vector, and you continue until the offset of the next key or the end of the vector.
+The `usize` offset for each value tells you where to start in the `upds` vector, and you continue until the offset of the next value or the end of the vector.
+
+The data structure supports high throughput sequential reads and writes, random access reads through binary search on keys, and random access writes through a [log-structure merge-tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree) idiom (although perhaps 'merge-list' is more appropriate).
+
+The overhead is one `usize` for each key, and another `usize` for each distinct `(key, val)` pair.
+You have three allocations, rather than a number proportional to the number of keys or key-value pairs.
+The overhead seems pretty small, until we perform a more thorough accounting.
+
+### A More Thorough Accounting
+
+Although Materialize maintains only two `usize` (each 8 bytes) beyond the `K`, `V`, `T`, and `D` information it needs for updates, there is more overhead behind the scenes.
+
+In Materialize both `K` and `V` are `Row` types, which are variable-length byte sequences encoding column data.
+In Rust a `Vec<u8>` provides a vector of bytes, and takes 24 bytes in addition to the binary data itself.
+In fact we have used a 32 byte version that allows for some amount of in-line allocation, but meant that the minimum sizes of `K` plus `V` is 64 bytes, potentially in addition to the binary row data itself.
+
+Both `T` and `D` are each 8 byte integers, because there are many possible times, and many possible copies of the same record.
+Adding these together, we get an overhead accounting of
+```
+key offset:  8 bytes
+val offset:  8 bytes
+key row:    32 bytes
+val row:    32 bytes
+time:        8 bytes
+diff:        8 bytes
+--------------------
+overhead    96 bytes
+```
+The minimum buy-in for each update is 96 bytes.
+These 96 bytes may cover no actual row data, and can just be pure overhead.
+
+### Optimization
+
+Fortunately, the more thorough accounting leads us to a clearer understanding of opportunities.
+Every byte that is not actual binary payload is in play as optimization potential.
+Let's discuss a few of the immediate opportunities.
+
+#### Optimizing `(Time, Diff)` for Snapshots
+
+Materialize first computes and then maintains SQL views over your data.
+A substantial volume of updates describe the data as it initially exists, an initial 'snapshot', before changes start to happen.
+As changes happen we continually roll them up into the snapshot, so even a live system has a great deal of 'snapshot' updates.
+
+The snapshot updates commonly have `(time, diff)` equal to `(now, 1)`.
+That is, each `(key, val)` pair in the snapshot exists 'right now', and just once. 
+This provides an opportunity for bespoke compression: if a `(time, diff)` pair repeats we are able to avoid writing it down repeatedly.
+In fact, we can sneak this in at zero overhead by taking advantage of a quirk in our `usize` offsets: they *should* always strictly increase to indicate ranges of updates, because empty ranges should not be recorded, but we can use a repetition (a non-increase) to indicate that the preceding updates should be reused as well.
+
+This typically saves 16 bytes per update for the snapshot, and brings us down to 80 bytes of overhead.
+```
+key offset:  8 bytes
+val offset:  8 bytes
+key row:    32 bytes
+val row:    32 bytes
+--------------------
+overhead:   80 bytes
+```
+
+#### Optimizing `Row` representation
+
+Although we have a 32 byte `Row` we could get by with much less.
+Just like we appended lists and stored offsets to track the bounds, we could append lists of bytes into one large `Vec<u8>` and maintain only the `usize` offsets that tell us where each sequence starts and stops.
+
+This takes us from 32 bytes with the option for in-line allocation, to 8 bytes without that option.
+This applies twice, once to each of `key` and `val`.
+Moreover, we avoid an *allocation* for each `key` and `val`, which evades some further unaccounted overhead in and around memory management.
+We now have four offsets, two for each of `key` and `val`, which will be important next.
+```
+key offset:     8 bytes
+val offset:     8 bytes
+key row offset: 8 bytes
+val row offset: 8 bytes
+-----------------------
+overhead:      32 bytes
+```
+
+#### Optimizing `usize` Offsets
+
+Our `usize` offsets take 8 bytes, but rarely get large enough to need more than 4 bytes.
+This is because we end up 'chunking' our data to manageable sizes, and those chunk sizes rarely exceed 4GB, for which a `u32` would be sufficient.
+Rather than use a `Vec<usize>` to store these offsets, we can first use a `Vec<u32>`, and should we exceed 4 billion-ish we can cut-over new elements to a `Vec<u64>`.
+
+This shaves the four `usize` offsets down from 32 bytes to 16 bytes, in most cases.
+```
+key offset:     4 bytes
+val offset:     4 bytes
+key row offset: 4 bytes
+val row offset: 4 bytes
+-----------------------
+overhead:      16 bytes
+```
+
+Going even further, these offsets often have very simple structure.
+When there is exactly one value for each key (e.g. as in a primary key relationship) the key offsets are exactly the sequence 0, 1, 2, ...
+When considering the snapshot, the value offsets are all zero (recall that repetitions indicate repeated `(time, diff)` pairs).
+When the binary slices have the same length (e.g. for fixed-width columns) the corresponding row offsets are the integer multiples of this length.
+Each of these cases can be encoded by a single 'stride' and a length, using two integers in total rather than any per element.
+
+These further optimizations can bring the 16 bytes of overhead down, all the way to zero when stars align.
+
+### Further Optimization and Future Work
+
+With nearly zero overhead, you may be surprised to learn that we are not yet done.
+But in fact, there is still opportunity to further reduce cost!
+
+#### Paging Binary Data to Disk
+
+Materialize, by way of differential dataflow, performs its random accesses in a way that [resembles sequential scans](https://github.com/frankmcsherry/blog/blob/master/posts/2015-08-15.md) (essentially: batching and sorting look-ups before they happen).
+This means that putting binary payload data on secondary storage like disk is not nearly as problematic as it would be were we to access it randomly, as in a hash map.
+Disk is obviously substantially cheaper than memory, and it provides the opportunity to trade away peak responsiveness for some cost reduction.
+
+In fact we've recently done this, backing in-memory allocations with disk allocations that Linux can spill to if it feels memory pressure.
+Expect a post in the near future talking about the design and implementation of this paging layer.
+
+Our experience so far is that initial snapshot computation experiences almost no degradation (the batch disk accesses are sequential scans), and once up and running update volumes are often low enough volume that local SSD accesses do not prevent timely results.
+The local disks are ephemeral caches, and don't come at the same cost as more durable options like cloud block storage.
+
+
+#### Columnar Compression
+
+Rust has some [handy mechanisms](https://blog.rust-lang.org/2022/10/28/gats-stabilization.html) that allow us to interpose code between the binary data for each row and the SQL logic that will respond to the row data.
+Our logic expects each row only as a sequence of `Datum` column values, and doesn't require an actual contiguous `[u8]` binary slab.
+This allows us some flexibility in how we record each row, potentially as a `[u8]` sequence, but also potentially re-ordered, transformed, or compressed.
+
+Cloud Data Warehouses often record their data in [columns](https://en.wikipedia.org/wiki/Column-oriented_DBMS), rather than rows, to improve their space efficiency while sacrificing performance for random access.
+We don't want to sacrifice too much random access, but we can employ several of the same compression tricks.
+In particular, we are able to sneak in various techniques, from [entropy coding](https://en.wikipedia.org/wiki/Entropy_coding) like Huffman and ANS, to [dictionary coding](https://en.wikipedia.org/wiki/Dictionary_coder) which often works well on denormalized relational data.
+Moreover, we can apply these techniques column-by-column, as columns often exhibit more commonality than do rows.
+
+The benefits of compression depend greatly on the nature of the data itself, and come at a non-trivial CPU overhead, but would unlock significant space savings and further opportunities.
+
+#### Query Optimization
+
+A final, evergreen opportunity is to continue to reduce the amount of information we need to maintain, independent of how it is represented.
+Materialize's optimizer pays specific attention to the amount of information maintained, which distinguishes it from most query optimizers that aim primarily to reduce query time.
+How and where we maintain state is very much under our control, and something we still have many opportunities to improve.
+
+### Wrapping Up
+
+Materialize provides value through the information it maintains, at the expense of maintaining intermediate state in scarce and costly storage (at least, relative to cloud blob storage).
+The cost of the storage can't be overlooked, and driving it down makes the provided value net out positive for even more use cases.
+In the limit, we'll get you to expect everything to be always up to date, because why shouldn't it be? 
+
+The cost optimizations described above are all live in Materialize now.
+It would be interesting to invite you to see the before and after, but actually we'd love to introduce you to the after, and let you see the next tranche of improvements as they happen.
+To try out Materialize, sign up at https://materialize.com/register/!
+
+<!-- ##{'timestamp':1703048400}## -->。">
+<meta property="og:title" content="Materialize and Memory">
+<meta property="og:description" content="Materialize keeps your SQL views up to date as the underlying data change.
+The value Materialize provides comes from how promptly it reflects new data, but its *cost* comes from the computer resources needed to achieve this.
+While we often talk about the value Materialize provides, and work continually to improve it, we are also hard at work continually reducing the cost.
+This work has had marked impact recently, and it felt like a great time to tell you about it, and the reductions in cost. 
+
+Materialize maintains your source and derived data (e.g. any materialized view), durably in economical cloud storage.
+However, to promptly maintain views and serve results we want to use much more immediately accessible storage.
+This storage, memory or as we'll see soon local disk, acts as a cache that must be fast, but needn't be durable.
+And of course, we would all like it to be as economical as possible.
+
+We've been dialing down the amount of 'overhead' associated with each intermediate maintained record in Materialize.
+We started some months ago at roughly 96 bytes of overhead (we will explain why), and we are now closing in on between 0 and 16 bytes of overhead, depending.
+This first wave of results have already seen many users memory requirements reduced by nearly 2x.
+Moreover, we've laid the groundwork for further improvements, through techniques like spill-to-disk, columnar layout, and compression.
+This further work comes at the cost of CPU cycles, but for the moment CPU cycles are abundant (and elastic) in a way that bytes of memory are not.
+
+In this post we'll map out where we started, detail the relatively simple steps we've taken to effectively reduce the overhead, and sketch the future we've opened up with some help from Rust.
+
+### The Fundemantals of Remembered Things
+
+Materialize models all data as relational rows, each of which has some number of columns, each of which contains one of a few different types of data.
+Over time the rows come and go, each changing their multiplicity through what we call 'updates': triples `(data, time, diff)`.
+Each update indicates a row `data` that at some moment `time` experiences a change `diff` in its multiplicity.
+These changes are often `+1` (insertion) or `-1` (deletion), or a mix of two or more (updates).
+
+Materialize maintains *indexed state* by viewing each `data` as a pair `(key, val)`, where `key` are some signified columns and `val` the remaining columns.
+When you create an index on a collection of data, you specify columns by which you hope to access the data; those columns define `key` and `val` for each `data`.
+We regularly want to fetch the history of some `key`: the associated `val`s and the `(time, diff)` changes they have undergone.
+
+The abstract data type we use maps from `key` to `val` to a list of `(time, diff)` pairs.
+In Rust you might use the `HashMap` type to support this abstraction:
+```rust
+/// Map from key, to value, to a list of times and differences.
+type Indexed<K, V, T, D> = HashMap<K, HashMap<V, Vec<(T, D)>>>;
+```
+
+For various reasons we won't actually want to use `HashMap` itself, and instead prefer other data structures that provide different performance characteristics.
+For example, we are interested in minimizing the number and size of allocations, and optimizing for both random and sequential read and write throughput.
+
+### A First Evolution, circa many years ago
+
+Differential dataflow's fundamental data structures are thusfar based on sorted lists.
+All of differential dataflow's historical performance, which has been pretty solid, has been based on [the perhaps surprising efficiency of sorted memory access](https://github.com/frankmcsherry/blog/blob/master/posts/2015-08-15.md).
+You may have thought we were going to impress you with exotic improvements on Rust's `HashMap` implementation, but we are going to stay with sorted lists.
+
+In the context of space efficiency, sorted lists have a compelling property that Rust's `HashMap` does not have: you can append multiple sorted lists into one larger list, and only need to record the boundaries between them.
+This reduces the per-key, and per-value overhead to something as small as an integer.
+You do miss out on some random access performance, but you also gain on sequential access performance.
+For the moment though, we're interested in space efficiency.
+
+To store the map from `key` to `val` to list of `(time, diff)` updates, differential dataflow uses roughly three vectors:
+```rust
+/// Simplification, for clarity.
+struct Indexed<K, V, T, D> {
+    /// key, and the start of its sorted run in `self.vals`.
+    keys: Vec<(K, usize)>,
+    /// val, and the start of its sorted run in `self.upds`.
+    vals: Vec<(V, usize)>,
+    /// lots and lots of updates.
+    upds: Vec<(T, D)>,
+}
+```
+
+Each key is present once, in sorted order. 
+The `usize` offset for each key tells you where to start in the `vals` vector, and you continue until the offset of the next key or the end of the vector.
+The `usize` offset for each value tells you where to start in the `upds` vector, and you continue until the offset of the next value or the end of the vector.
+
+The data structure supports high throughput sequential reads and writes, random access reads through binary search on keys, and random access writes through a [log-structure merge-tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree) idiom (although perhaps 'merge-list' is more appropriate).
+
+The overhead is one `usize` for each key, and another `usize` for each distinct `(key, val)` pair.
+You have three allocations, rather than a number proportional to the number of keys or key-value pairs.
+The overhead seems pretty small, until we perform a more thorough accounting.
+
+### A More Thorough Accounting
+
+Although Materialize maintains only two `usize` (each 8 bytes) beyond the `K`, `V`, `T`, and `D` information it needs for updates, there is more overhead behind the scenes.
+
+In Materialize both `K` and `V` are `Row` types, which are variable-length byte sequences encoding column data.
+In Rust a `Vec<u8>` provides a vector of bytes, and takes 24 bytes in addition to the binary data itself.
+In fact we have used a 32 byte version that allows for some amount of in-line allocation, but meant that the minimum sizes of `K` plus `V` is 64 bytes, potentially in addition to the binary row data itself.
+
+Both `T` and `D` are each 8 byte integers, because there are many possible times, and many possible copies of the same record.
+Adding these together, we get an overhead accounting of
+```
+key offset:  8 bytes
+val offset:  8 bytes
+key row:    32 bytes
+val row:    32 bytes
+time:        8 bytes
+diff:        8 bytes
+--------------------
+overhead    96 bytes
+```
+The minimum buy-in for each update is 96 bytes.
+These 96 bytes may cover no actual row data, and can just be pure overhead.
+
+### Optimization
+
+Fortunately, the more thorough accounting leads us to a clearer understanding of opportunities.
+Every byte that is not actual binary payload is in play as optimization potential.
+Let's discuss a few of the immediate opportunities.
+
+#### Optimizing `(Time, Diff)` for Snapshots
+
+Materialize first computes and then maintains SQL views over your data.
+A substantial volume of updates describe the data as it initially exists, an initial 'snapshot', before changes start to happen.
+As changes happen we continually roll them up into the snapshot, so even a live system has a great deal of 'snapshot' updates.
+
+The snapshot updates commonly have `(time, diff)` equal to `(now, 1)`.
+That is, each `(key, val)` pair in the snapshot exists 'right now', and just once. 
+This provides an opportunity for bespoke compression: if a `(time, diff)` pair repeats we are able to avoid writing it down repeatedly.
+In fact, we can sneak this in at zero overhead by taking advantage of a quirk in our `usize` offsets: they *should* always strictly increase to indicate ranges of updates, because empty ranges should not be recorded, but we can use a repetition (a non-increase) to indicate that the preceding updates should be reused as well.
+
+This typically saves 16 bytes per update for the snapshot, and brings us down to 80 bytes of overhead.
+```
+key offset:  8 bytes
+val offset:  8 bytes
+key row:    32 bytes
+val row:    32 bytes
+--------------------
+overhead:   80 bytes
+```
+
+#### Optimizing `Row` representation
+
+Although we have a 32 byte `Row` we could get by with much less.
+Just like we appended lists and stored offsets to track the bounds, we could append lists of bytes into one large `Vec<u8>` and maintain only the `usize` offsets that tell us where each sequence starts and stops.
+
+This takes us from 32 bytes with the option for in-line allocation, to 8 bytes without that option.
+This applies twice, once to each of `key` and `val`.
+Moreover, we avoid an *allocation* for each `key` and `val`, which evades some further unaccounted overhead in and around memory management.
+We now have four offsets, two for each of `key` and `val`, which will be important next.
+```
+key offset:     8 bytes
+val offset:     8 bytes
+key row offset: 8 bytes
+val row offset: 8 bytes
+-----------------------
+overhead:      32 bytes
+```
+
+#### Optimizing `usize` Offsets
+
+Our `usize` offsets take 8 bytes, but rarely get large enough to need more than 4 bytes.
+This is because we end up 'chunking' our data to manageable sizes, and those chunk sizes rarely exceed 4GB, for which a `u32` would be sufficient.
+Rather than use a `Vec<usize>` to store these offsets, we can first use a `Vec<u32>`, and should we exceed 4 billion-ish we can cut-over new elements to a `Vec<u64>`.
+
+This shaves the four `usize` offsets down from 32 bytes to 16 bytes, in most cases.
+```
+key offset:     4 bytes
+val offset:     4 bytes
+key row offset: 4 bytes
+val row offset: 4 bytes
+-----------------------
+overhead:      16 bytes
+```
+
+Going even further, these offsets often have very simple structure.
+When there is exactly one value for each key (e.g. as in a primary key relationship) the key offsets are exactly the sequence 0, 1, 2, ...
+When considering the snapshot, the value offsets are all zero (recall that repetitions indicate repeated `(time, diff)` pairs).
+When the binary slices have the same length (e.g. for fixed-width columns) the corresponding row offsets are the integer multiples of this length.
+Each of these cases can be encoded by a single 'stride' and a length, using two integers in total rather than any per element.
+
+These further optimizations can bring the 16 bytes of overhead down, all the way to zero when stars align.
+
+### Further Optimization and Future Work
+
+With nearly zero overhead, you may be surprised to learn that we are not yet done.
+But in fact, there is still opportunity to further reduce cost!
+
+#### Paging Binary Data to Disk
+
+Materialize, by way of differential dataflow, performs its random accesses in a way that [resembles sequential scans](https://github.com/frankmcsherry/blog/blob/master/posts/2015-08-15.md) (essentially: batching and sorting look-ups before they happen).
+This means that putting binary payload data on secondary storage like disk is not nearly as problematic as it would be were we to access it randomly, as in a hash map.
+Disk is obviously substantially cheaper than memory, and it provides the opportunity to trade away peak responsiveness for some cost reduction.
+
+In fact we've recently done this, backing in-memory allocations with disk allocations that Linux can spill to if it feels memory pressure.
+Expect a post in the near future talking about the design and implementation of this paging layer.
+
+Our experience so far is that initial snapshot computation experiences almost no degradation (the batch disk accesses are sequential scans), and once up and running update volumes are often low enough volume that local SSD accesses do not prevent timely results.
+The local disks are ephemeral caches, and don't come at the same cost as more durable options like cloud block storage.
+
+
+#### Columnar Compression
+
+Rust has some [handy mechanisms](https://blog.rust-lang.org/2022/10/28/gats-stabilization.html) that allow us to interpose code between the binary data for each row and the SQL logic that will respond to the row data.
+Our logic expects each row only as a sequence of `Datum` column values, and doesn't require an actual contiguous `[u8]` binary slab.
+This allows us some flexibility in how we record each row, potentially as a `[u8]` sequence, but also potentially re-ordered, transformed, or compressed.
+
+Cloud Data Warehouses often record their data in [columns](https://en.wikipedia.org/wiki/Column-oriented_DBMS), rather than rows, to improve their space efficiency while sacrificing performance for random access.
+We don't want to sacrifice too much random access, but we can employ several of the same compression tricks.
+In particular, we are able to sneak in various techniques, from [entropy coding](https://en.wikipedia.org/wiki/Entropy_coding) like Huffman and ANS, to [dictionary coding](https://en.wikipedia.org/wiki/Dictionary_coder) which often works well on denormalized relational data.
+Moreover, we can apply these techniques column-by-column, as columns often exhibit more commonality than do rows.
+
+The benefits of compression depend greatly on the nature of the data itself, and come at a non-trivial CPU overhead, but would unlock significant space savings and further opportunities.
+
+#### Query Optimization
+
+A final, evergreen opportunity is to continue to reduce the amount of information we need to maintain, independent of how it is represented.
+Materialize's optimizer pays specific attention to the amount of information maintained, which distinguishes it from most query optimizers that aim primarily to reduce query time.
+How and where we maintain state is very much under our control, and something we still have many opportunities to improve.
+
+### Wrapping Up
+
+Materialize provides value through the information it maintains, at the expense of maintaining intermediate state in scarce and costly storage (at least, relative to cloud blob storage).
+The cost of the storage can't be overlooked, and driving it down makes the provided value net out positive for even more use cases.
+In the limit, we'll get you to expect everything to be always up to date, because why shouldn't it be? 
+
+The cost optimizations described above are all live in Materialize now.
+It would be interesting to invite you to see the before and after, but actually we'd love to introduce you to the after, and let you see the next tranche of improvements as they happen.
+To try out Materialize, sign up at https://materialize.com/register/!
+
+<!-- ##{'timestamp':1703048400}## -->。">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://nuowoo.github.io/blog/post/Materialize%20and%20Memory.html">
+<meta property="og:image" content="https://github.githubassets.com/favicons/favicon.svg">
+<title>Materialize and Memory</title>
+<link href="//unpkg.com/@wooorm/starry-night@2.1.1/style/both.css" rel="stylesheet" />
+
+
+</head>
+<style>
+body{box-sizing: border-box;min-width: 200px;max-width: 900px;margin: 20px auto;padding: 45px;font-size: 16px;font-family: sans-serif;line-height: 1.25;}
+#header{display:flex;padding-bottom:8px;border-bottom: 1px solid var(--borderColor-muted, var(--color-border-muted));margin-bottom: 16px;}
+#footer {margin-top:64px; text-align: center;font-size: small;}
+
+</style>
+
+<style>
+.postTitle{margin: auto 0;font-size:40px;font-weight:bold;}
+.title-right{display:flex;margin:auto 0 0 auto;}
+.title-right .circle{padding: 14px 16px;margin-right:8px;}
+#postBody{border-bottom: 1px solid var(--color-border-default);padding-bottom:36px;}
+#postBody hr{height:2px;}
+#cmButton{height:48px;margin-top:48px;}
+#comments{margin-top:64px;}
+.g-emoji{font-size:24px;}
+@media (max-width: 600px) {
+    body {padding: 8px;}
+    .postTitle{font-size:24px;}
+}
+.copy-feedback {
+    display: none;
+    position: absolute;
+    top: 10px;
+    right: 50px;
+    color: var(--color-fg-on-emphasis);
+    background-color: var(--color-fg-muted);
+    border-radius: 3px;
+    padding: 5px 8px;
+    font-size: 12px;
+}
+</style>
+
+
+
+
+<body>
+    <div id="header">
+<h1 class="postTitle">Materialize and Memory</h1>
+<div class="title-right">
+    <a href="https://nuowoo.github.io/blog" id="buttonHome" class="btn btn-invisible circle" title="首页">
+        <svg class="octicon" width="16" height="16">
+            <path id="pathHome" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+    
+    <a href="https://github.com/nuowoo/blog/issues/5" target="_blank" class="btn btn-invisible circle" title="Issue">
+        <svg class="octicon" width="16" height="16">
+            <path id="pathIssue" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+    
+
+    <a class="btn btn-invisible circle" onclick="modeSwitch();" title="切换主题">
+        <svg class="octicon" width="16" height="16" >
+            <path id="themeSwitch" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+
+</div>
+</div>
+    <div id="content">
+<div class="markdown-body" id="postBody"><p>Materialize keeps your SQL views up to date as the underlying data change.<br>
+The value Materialize provides comes from how promptly it reflects new data, but its <em>cost</em> comes from the computer resources needed to achieve this.<br>
+While we often talk about the value Materialize provides, and work continually to improve it, we are also hard at work continually reducing the cost.<br>
+This work has had marked impact recently, and it felt like a great time to tell you about it, and the reductions in cost.</p>
+<p>Materialize maintains your source and derived data (e.g. any materialized view), durably in economical cloud storage.<br>
+However, to promptly maintain views and serve results we want to use much more immediately accessible storage.<br>
+This storage, memory or as we'll see soon local disk, acts as a cache that must be fast, but needn't be durable.<br>
+And of course, we would all like it to be as economical as possible.</p>
+<p>We've been dialing down the amount of "overhead" associated with each intermediate maintained record in Materialize.<br>
+We started some months ago at roughly 96 bytes of overhead (we will explain why), and we are now closing in on between 0 and 16 bytes of overhead, depending.<br>
+This first wave of results have already seen many users memory requirements reduced by nearly 2x.<br>
+Moreover, we've laid the groundwork for further improvements, through techniques like spill-to-disk, columnar layout, and compression.<br>
+This further work comes at the cost of CPU cycles, but for the moment CPU cycles are abundant (and elastic) in a way that bytes of memory are not.</p>
+<p>In this post we'll map out where we started, detail the relatively simple steps we've taken to effectively reduce the overhead, and sketch the future we've opened up with some help from Rust.</p>
+<h3>The Fundemantals of Remembered Things</h3>
+<p>Materialize models all data as relational rows, each of which has some number of columns, each of which contains one of a few different types of data.<br>
+Over time the rows come and go, each changing their multiplicity through what we call "updates": triples <code class="notranslate">(data, time, diff)</code>.<br>
+Each update indicates a row <code class="notranslate">data</code> that at some moment <code class="notranslate">time</code> experiences a change <code class="notranslate">diff</code> in its multiplicity.<br>
+These changes are often <code class="notranslate">+1</code> (insertion) or <code class="notranslate">-1</code> (deletion), or a mix of two or more (updates).</p>
+<p>Materialize maintains <em>indexed state</em> by viewing each <code class="notranslate">data</code> as a pair <code class="notranslate">(key, val)</code>, where <code class="notranslate">key</code> are some signified columns and <code class="notranslate">val</code> the remaining columns.<br>
+When you create an index on a collection of data, you specify columns by which you hope to access the data; those columns define <code class="notranslate">key</code> and <code class="notranslate">val</code> for each <code class="notranslate">data</code>.<br>
+We regularly want to fetch the history of some <code class="notranslate">key</code>: the associated <code class="notranslate">val</code>s and the <code class="notranslate">(time, diff)</code> changes they have undergone.</p>
+<p>The abstract data type we use maps from <code class="notranslate">key</code> to <code class="notranslate">val</code> to a list of <code class="notranslate">(time, diff)</code> pairs.<br>
+In Rust you might use the <code class="notranslate">HashMap</code> type to support this abstraction:</p>
+<div class="highlight highlight-source-rust"><pre class="notranslate"><span class="pl-c">/// Map from key, to value, to a list of times and differences.</span>
+<span class="pl-k">type</span> <span class="pl-smi">Indexed</span><span class="pl-kos">&lt;</span><span class="pl-smi">K</span><span class="pl-kos">,</span> <span class="pl-smi">V</span><span class="pl-kos">,</span> <span class="pl-smi">T</span><span class="pl-kos">,</span> <span class="pl-smi">D</span><span class="pl-kos">&gt;</span> = <span class="pl-smi">HashMap</span><span class="pl-kos">&lt;</span><span class="pl-smi">K</span><span class="pl-kos">,</span> <span class="pl-smi">HashMap</span><span class="pl-kos">&lt;</span><span class="pl-smi">V</span><span class="pl-kos">,</span> <span class="pl-smi">Vec</span><span class="pl-kos">&lt;</span><span class="pl-kos">(</span><span class="pl-smi">T</span><span class="pl-kos">,</span> <span class="pl-smi">D</span><span class="pl-kos">)</span><span class="pl-kos">&gt;</span><span class="pl-kos">&gt;</span><span class="pl-kos">&gt;</span><span class="pl-kos">;</span></pre></div>
+<p>For various reasons we won't actually want to use <code class="notranslate">HashMap</code> itself, and instead prefer other data structures that provide different performance characteristics.<br>
+For example, we are interested in minimizing the number and size of allocations, and optimizing for both random and sequential read and write throughput.</p>
+<h3>A First Evolution, circa many years ago</h3>
+<p>Differential dataflow's fundamental data structures are thusfar based on sorted lists.<br>
+All of differential dataflow's historical performance, which has been pretty solid, has been based on <a href="https://github.com/frankmcsherry/blog/blob/master/posts/2015-08-15.md">the perhaps surprising efficiency of sorted memory access</a>.<br>
+You may have thought we were going to impress you with exotic improvements on Rust's <code class="notranslate">HashMap</code> implementation, but we are going to stay with sorted lists.</p>
+<p>In the context of space efficiency, sorted lists have a compelling property that Rust's <code class="notranslate">HashMap</code> does not have: you can append multiple sorted lists into one larger list, and only need to record the boundaries between them.<br>
+This reduces the per-key, and per-value overhead to something as small as an integer.<br>
+You do miss out on some random access performance, but you also gain on sequential access performance.<br>
+For the moment though, we're interested in space efficiency.</p>
+<p>To store the map from <code class="notranslate">key</code> to <code class="notranslate">val</code> to list of <code class="notranslate">(time, diff)</code> updates, differential dataflow uses roughly three vectors:</p>
+<div class="highlight highlight-source-rust"><pre class="notranslate"><span class="pl-c">/// Simplification, for clarity.</span>
+<span class="pl-k">struct</span> <span class="pl-smi">Indexed</span><span class="pl-kos">&lt;</span><span class="pl-smi">K</span><span class="pl-kos">,</span> <span class="pl-smi">V</span><span class="pl-kos">,</span> <span class="pl-smi">T</span><span class="pl-kos">,</span> <span class="pl-smi">D</span><span class="pl-kos">&gt;</span> <span class="pl-kos">{</span>
+    <span class="pl-c">/// key, and the start of its sorted run in `self.vals`.</span>
+    <span class="pl-c1">keys</span><span class="pl-kos">:</span> <span class="pl-smi">Vec</span><span class="pl-kos">&lt;</span><span class="pl-kos">(</span><span class="pl-smi">K</span><span class="pl-kos">,</span> <span class="pl-smi">usize</span><span class="pl-kos">)</span><span class="pl-kos">&gt;</span><span class="pl-kos">,</span>
+    <span class="pl-c">/// val, and the start of its sorted run in `self.upds`.</span>
+    <span class="pl-c1">vals</span><span class="pl-kos">:</span> <span class="pl-smi">Vec</span><span class="pl-kos">&lt;</span><span class="pl-kos">(</span><span class="pl-smi">V</span><span class="pl-kos">,</span> <span class="pl-smi">usize</span><span class="pl-kos">)</span><span class="pl-kos">&gt;</span><span class="pl-kos">,</span>
+    <span class="pl-c">/// lots and lots of updates.</span>
+    <span class="pl-c1">upds</span><span class="pl-kos">:</span> <span class="pl-smi">Vec</span><span class="pl-kos">&lt;</span><span class="pl-kos">(</span><span class="pl-smi">T</span><span class="pl-kos">,</span> <span class="pl-smi">D</span><span class="pl-kos">)</span><span class="pl-kos">&gt;</span><span class="pl-kos">,</span>
+<span class="pl-kos">}</span></pre></div>
+<p>Each key is present once, in sorted order.<br>
+The <code class="notranslate">usize</code> offset for each key tells you where to start in the <code class="notranslate">vals</code> vector, and you continue until the offset of the next key or the end of the vector.<br>
+The <code class="notranslate">usize</code> offset for each value tells you where to start in the <code class="notranslate">upds</code> vector, and you continue until the offset of the next value or the end of the vector.</p>
+<p>The data structure supports high throughput sequential reads and writes, random access reads through binary search on keys, and random access writes through a <a href="https://en.wikipedia.org/wiki/Log-structured_merge-tree" rel="nofollow">log-structure merge-tree</a> idiom (although perhaps "merge-list" is more appropriate).</p>
+<p>The overhead is one <code class="notranslate">usize</code> for each key, and another <code class="notranslate">usize</code> for each distinct <code class="notranslate">(key, val)</code> pair.<br>
+You have three allocations, rather than a number proportional to the number of keys or key-value pairs.<br>
+The overhead seems pretty small, until we perform a more thorough accounting.</p>
+<h3>A More Thorough Accounting</h3>
+<p>Although Materialize maintains only two <code class="notranslate">usize</code> (each 8 bytes) beyond the <code class="notranslate">K</code>, <code class="notranslate">V</code>, <code class="notranslate">T</code>, and <code class="notranslate">D</code> information it needs for updates, there is more overhead behind the scenes.</p>
+<p>In Materialize both <code class="notranslate">K</code> and <code class="notranslate">V</code> are <code class="notranslate">Row</code> types, which are variable-length byte sequences encoding column data.<br>
+In Rust a <code class="notranslate">Vec&lt;u8&gt;</code> provides a vector of bytes, and takes 24 bytes in addition to the binary data itself.<br>
+In fact we have used a 32 byte version that allows for some amount of in-line allocation, but meant that the minimum sizes of <code class="notranslate">K</code> plus <code class="notranslate">V</code> is 64 bytes, potentially in addition to the binary row data itself.</p>
+<p>Both <code class="notranslate">T</code> and <code class="notranslate">D</code> are each 8 byte integers, because there are many possible times, and many possible copies of the same record.<br>
+Adding these together, we get an overhead accounting of</p>
+<pre class="notranslate"><code class="notranslate">key offset:  8 bytes
+val offset:  8 bytes
+key row:    32 bytes
+val row:    32 bytes
+time:        8 bytes
+diff:        8 bytes
+--------------------
+overhead    96 bytes
+</code></pre>
+<p>The minimum buy-in for each update is 96 bytes.<br>
+These 96 bytes may cover no actual row data, and can just be pure overhead.</p>
+<h3>Optimization</h3>
+<p>Fortunately, the more thorough accounting leads us to a clearer understanding of opportunities.<br>
+Every byte that is not actual binary payload is in play as optimization potential.<br>
+Let's discuss a few of the immediate opportunities.</p>
+<h4>Optimizing <code class="notranslate">(Time, Diff)</code> for Snapshots</h4>
+<p>Materialize first computes and then maintains SQL views over your data.<br>
+A substantial volume of updates describe the data as it initially exists, an initial "snapshot", before changes start to happen.<br>
+As changes happen we continually roll them up into the snapshot, so even a live system has a great deal of "snapshot" updates.</p>
+<p>The snapshot updates commonly have <code class="notranslate">(time, diff)</code> equal to <code class="notranslate">(now, 1)</code>.<br>
+That is, each <code class="notranslate">(key, val)</code> pair in the snapshot exists "right now", and just once.<br>
+This provides an opportunity for bespoke compression: if a <code class="notranslate">(time, diff)</code> pair repeats we are able to avoid writing it down repeatedly.<br>
+In fact, we can sneak this in at zero overhead by taking advantage of a quirk in our <code class="notranslate">usize</code> offsets: they <em>should</em> always strictly increase to indicate ranges of updates, because empty ranges should not be recorded, but we can use a repetition (a non-increase) to indicate that the preceding updates should be reused as well.</p>
+<p>This typically saves 16 bytes per update for the snapshot, and brings us down to 80 bytes of overhead.</p>
+<pre class="notranslate"><code class="notranslate">key offset:  8 bytes
+val offset:  8 bytes
+key row:    32 bytes
+val row:    32 bytes
+--------------------
+overhead:   80 bytes
+</code></pre>
+<h4>Optimizing <code class="notranslate">Row</code> representation</h4>
+<p>Although we have a 32 byte <code class="notranslate">Row</code> we could get by with much less.<br>
+Just like we appended lists and stored offsets to track the bounds, we could append lists of bytes into one large <code class="notranslate">Vec&lt;u8&gt;</code> and maintain only the <code class="notranslate">usize</code> offsets that tell us where each sequence starts and stops.</p>
+<p>This takes us from 32 bytes with the option for in-line allocation, to 8 bytes without that option.<br>
+This applies twice, once to each of <code class="notranslate">key</code> and <code class="notranslate">val</code>.<br>
+Moreover, we avoid an <em>allocation</em> for each <code class="notranslate">key</code> and <code class="notranslate">val</code>, which evades some further unaccounted overhead in and around memory management.<br>
+We now have four offsets, two for each of <code class="notranslate">key</code> and <code class="notranslate">val</code>, which will be important next.</p>
+<pre class="notranslate"><code class="notranslate">key offset:     8 bytes
+val offset:     8 bytes
+key row offset: 8 bytes
+val row offset: 8 bytes
+-----------------------
+overhead:      32 bytes
+</code></pre>
+<h4>Optimizing <code class="notranslate">usize</code> Offsets</h4>
+<p>Our <code class="notranslate">usize</code> offsets take 8 bytes, but rarely get large enough to need more than 4 bytes.<br>
+This is because we end up "chunking" our data to manageable sizes, and those chunk sizes rarely exceed 4GB, for which a <code class="notranslate">u32</code> would be sufficient.<br>
+Rather than use a <code class="notranslate">Vec&lt;usize&gt;</code> to store these offsets, we can first use a <code class="notranslate">Vec&lt;u32&gt;</code>, and should we exceed 4 billion-ish we can cut-over new elements to a <code class="notranslate">Vec&lt;u64&gt;</code>.</p>
+<p>This shaves the four <code class="notranslate">usize</code> offsets down from 32 bytes to 16 bytes, in most cases.</p>
+<pre class="notranslate"><code class="notranslate">key offset:     4 bytes
+val offset:     4 bytes
+key row offset: 4 bytes
+val row offset: 4 bytes
+-----------------------
+overhead:      16 bytes
+</code></pre>
+<p>Going even further, these offsets often have very simple structure.<br>
+When there is exactly one value for each key (e.g. as in a primary key relationship) the key offsets are exactly the sequence 0, 1, 2, ...<br>
+When considering the snapshot, the value offsets are all zero (recall that repetitions indicate repeated <code class="notranslate">(time, diff)</code> pairs).<br>
+When the binary slices have the same length (e.g. for fixed-width columns) the corresponding row offsets are the integer multiples of this length.<br>
+Each of these cases can be encoded by a single "stride" and a length, using two integers in total rather than any per element.</p>
+<p>These further optimizations can bring the 16 bytes of overhead down, all the way to zero when stars align.</p>
+<h3>Further Optimization and Future Work</h3>
+<p>With nearly zero overhead, you may be surprised to learn that we are not yet done.<br>
+But in fact, there is still opportunity to further reduce cost!</p>
+<h4>Paging Binary Data to Disk</h4>
+<p>Materialize, by way of differential dataflow, performs its random accesses in a way that <a href="https://github.com/frankmcsherry/blog/blob/master/posts/2015-08-15.md">resembles sequential scans</a> (essentially: batching and sorting look-ups before they happen).<br>
+This means that putting binary payload data on secondary storage like disk is not nearly as problematic as it would be were we to access it randomly, as in a hash map.<br>
+Disk is obviously substantially cheaper than memory, and it provides the opportunity to trade away peak responsiveness for some cost reduction.</p>
+<p>In fact we've recently done this, backing in-memory allocations with disk allocations that Linux can spill to if it feels memory pressure.<br>
+Expect a post in the near future talking about the design and implementation of this paging layer.</p>
+<p>Our experience so far is that initial snapshot computation experiences almost no degradation (the batch disk accesses are sequential scans), and once up and running update volumes are often low enough volume that local SSD accesses do not prevent timely results.<br>
+The local disks are ephemeral caches, and don't come at the same cost as more durable options like cloud block storage.</p>
+<h4>Columnar Compression</h4>
+<p>Rust has some <a href="https://blog.rust-lang.org/2022/10/28/gats-stabilization.html" rel="nofollow">handy mechanisms</a> that allow us to interpose code between the binary data for each row and the SQL logic that will respond to the row data.<br>
+Our logic expects each row only as a sequence of <code class="notranslate">Datum</code> column values, and doesn't require an actual contiguous <code class="notranslate">[u8]</code> binary slab.<br>
+This allows us some flexibility in how we record each row, potentially as a <code class="notranslate">[u8]</code> sequence, but also potentially re-ordered, transformed, or compressed.</p>
+<p>Cloud Data Warehouses often record their data in <a href="https://en.wikipedia.org/wiki/Column-oriented_DBMS" rel="nofollow">columns</a>, rather than rows, to improve their space efficiency while sacrificing performance for random access.<br>
+We don't want to sacrifice too much random access, but we can employ several of the same compression tricks.<br>
+In particular, we are able to sneak in various techniques, from <a href="https://en.wikipedia.org/wiki/Entropy_coding" rel="nofollow">entropy coding</a> like Huffman and ANS, to <a href="https://en.wikipedia.org/wiki/Dictionary_coder" rel="nofollow">dictionary coding</a> which often works well on denormalized relational data.<br>
+Moreover, we can apply these techniques column-by-column, as columns often exhibit more commonality than do rows.</p>
+<p>The benefits of compression depend greatly on the nature of the data itself, and come at a non-trivial CPU overhead, but would unlock significant space savings and further opportunities.</p>
+<h4>Query Optimization</h4>
+<p>A final, evergreen opportunity is to continue to reduce the amount of information we need to maintain, independent of how it is represented.<br>
+Materialize's optimizer pays specific attention to the amount of information maintained, which distinguishes it from most query optimizers that aim primarily to reduce query time.<br>
+How and where we maintain state is very much under our control, and something we still have many opportunities to improve.</p>
+<h3>Wrapping Up</h3>
+<p>Materialize provides value through the information it maintains, at the expense of maintaining intermediate state in scarce and costly storage (at least, relative to cloud blob storage).<br>
+The cost of the storage can't be overlooked, and driving it down makes the provided value net out positive for even more use cases.<br>
+In the limit, we'll get you to expect everything to be always up to date, because why shouldn't it be?</p>
+<p>The cost optimizations described above are all live in Materialize now.<br>
+It would be interesting to invite you to see the before and after, but actually we'd love to introduce you to the after, and let you see the next tranche of improvements as they happen.<br>
+To try out Materialize, sign up at <a href="https://materialize.com/register/" rel="nofollow">https://materialize.com/register/</a>!</p>
+</div>
+<div style="font-size:small;margin-top:8px;float:right;"></div>
+
+<button class="btn btn-block" type="button" onclick="openComments()" id="cmButton">评论</button>
+<div class="comments" id="comments"></div>
+
+</div>
+    <div id="footer"><div id="footer1">Copyright © <span id="copyrightYear"></span> <a href="https://nuowoo.github.io/blog">Computer Scientist</a></div>
+<div id="footer2">
+    <span id="runday"></span><span>Powered by <a href="https://meekdai.com/Gmeek.html" target="_blank">Gmeek</a></span>
+</div>
+
+<script>
+var now=new Date();
+document.getElementById("copyrightYear").innerHTML=now.getFullYear();
+
+if(""!=""){
+    var startSite=new Date("");
+    var diff=now.getTime()-startSite.getTime();
+    var diffDay=Math.floor(diff/(1000*60*60*24));
+    document.getElementById("runday").innerHTML="网站运行"+diffDay+"天"+" • ";
+}
+</script></div>
+</body>
+<script>
+var IconList={'sun': 'M8 10.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5zM8 12a4 4 0 100-8 4 4 0 000 8zM8 0a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0V.75A.75.75 0 018 0zm0 13a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0v-1.5A.75.75 0 018 13zM2.343 2.343a.75.75 0 011.061 0l1.06 1.061a.75.75 0 01-1.06 1.06l-1.06-1.06a.75.75 0 010-1.06zm9.193 9.193a.75.75 0 011.06 0l1.061 1.06a.75.75 0 01-1.06 1.061l-1.061-1.06a.75.75 0 010-1.061zM16 8a.75.75 0 01-.75.75h-1.5a.75.75 0 010-1.5h1.5A.75.75 0 0116 8zM3 8a.75.75 0 01-.75.75H.75a.75.75 0 010-1.5h1.5A.75.75 0 013 8zm10.657-5.657a.75.75 0 010 1.061l-1.061 1.06a.75.75 0 11-1.06-1.06l1.06-1.06a.75.75 0 011.06 0zm-9.193 9.193a.75.75 0 010 1.06l-1.06 1.061a.75.75 0 11-1.061-1.06l1.06-1.061a.75.75 0 011.061 0z', 'moon': 'M9.598 1.591a.75.75 0 01.785-.175 7 7 0 11-8.967 8.967.75.75 0 01.961-.96 5.5 5.5 0 007.046-7.046.75.75 0 01.175-.786zm1.616 1.945a7 7 0 01-7.678 7.678 5.5 5.5 0 107.678-7.678z', 'sync': 'M1.705 8.005a.75.75 0 0 1 .834.656 5.5 5.5 0 0 0 9.592 2.97l-1.204-1.204a.25.25 0 0 1 .177-.427h3.646a.25.25 0 0 1 .25.25v3.646a.25.25 0 0 1-.427.177l-1.38-1.38A7.002 7.002 0 0 1 1.05 8.84a.75.75 0 0 1 .656-.834ZM8 2.5a5.487 5.487 0 0 0-4.131 1.869l1.204 1.204A.25.25 0 0 1 4.896 6H1.25A.25.25 0 0 1 1 5.75V2.104a.25.25 0 0 1 .427-.177l1.38 1.38A7.002 7.002 0 0 1 14.95 7.16a.75.75 0 0 1-1.49.178A5.5 5.5 0 0 0 8 2.5Z', 'home': 'M6.906.664a1.749 1.749 0 0 1 2.187 0l5.25 4.2c.415.332.657.835.657 1.367v7.019A1.75 1.75 0 0 1 13.25 15h-3.5a.75.75 0 0 1-.75-.75V9H7v5.25a.75.75 0 0 1-.75.75h-3.5A1.75 1.75 0 0 1 1 13.25V6.23c0-.531.242-1.034.657-1.366l5.25-4.2Zm1.25 1.171a.25.25 0 0 0-.312 0l-5.25 4.2a.25.25 0 0 0-.094.196v7.019c0 .138.112.25.25.25H5.5V8.25a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 .75.75v5.25h2.75a.25.25 0 0 0 .25-.25V6.23a.25.25 0 0 0-.094-.195Z', 'github': 'M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z', 'copy': 'M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z', 'check': 'M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z'};
+var utterancesLoad=0;
+
+let themeSettings={
+    "dark": ["dark","moon","#00f0ff","dark-blue"],
+    "light": ["light","sun","#ff5000","github-light"],
+    "auto": ["auto","sync","","preferred-color-scheme"]
+};
+function changeTheme(mode, icon, color, utheme){
+    document.documentElement.setAttribute("data-color-mode",mode);
+    document.getElementById("themeSwitch").setAttribute("d",value=IconList[icon]);
+    document.getElementById("themeSwitch").parentNode.style.color=color;
+    if(utterancesLoad==1){utterancesTheme(utheme);}
+}
+function modeSwitch(){
+    let currentMode=document.documentElement.getAttribute('data-color-mode');
+    let newMode = currentMode === "light" ? "dark" : currentMode === "dark" ? "auto" : "light";
+    localStorage.setItem("meek_theme", newMode);
+    if(themeSettings[newMode]){
+        changeTheme(...themeSettings[newMode]);
+    }
+}
+function utterancesTheme(theme){
+    const message={type:'set-theme',theme: theme};
+    const iframe=document.getElementsByClassName('utterances-frame')[0];
+    iframe.contentWindow.postMessage(message,'https://utteranc.es');
+}
+if(themeSettings[theme]){changeTheme(...themeSettings[theme]);}
+console.log("\n %c Gmeek last https://github.com/Meekdai/Gmeek \n","padding:5px 0;background:#02d81d;color:#fff");
+</script>
+
+<script>
+document.getElementById("pathHome").setAttribute("d",IconList["home"]);
+document.getElementById("pathIssue").setAttribute("d",IconList["github"]);
+
+
+
+function openComments(){
+    cm=document.getElementById("comments");
+    cmButton=document.getElementById("cmButton");
+    cmButton.innerHTML="loading";
+    span=document.createElement("span");
+    span.setAttribute("class","AnimatedEllipsis");
+    cmButton.appendChild(span);
+
+    script=document.createElement("script");
+    script.setAttribute("src","https://utteranc.es/client.js");
+    script.setAttribute("repo","nuowoo/blog");
+    script.setAttribute("issue-term","title");
+    
+    if(localStorage.getItem("meek_theme")=="dark"){script.setAttribute("theme","dark-blue");}
+    else if(localStorage.getItem("meek_theme")=="light") {script.setAttribute("theme","github-light");}
+    else{script.setAttribute("theme","preferred-color-scheme");}
+    
+    script.setAttribute("crossorigin","anonymous");
+    script.setAttribute("async","");
+    cm.appendChild(script);
+
+    int=self.setInterval("iFrameLoading()",200);
+}
+
+function iFrameLoading(){
+    var utterances=document.getElementsByClassName('utterances');
+    if(utterances.length==1){
+        if(utterances[0].style.height!=""){
+            utterancesLoad=1;
+            int=window.clearInterval(int);
+            document.getElementById("cmButton").style.display="none";
+            console.log("utterances Load OK");
+        }
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const createClipboardHTML = (codeContent, additionalClasses = '') => `
+        <pre class="notranslate"><code class="notranslate">${codeContent}</code></pre>
+        <div class="clipboard-container position-absolute right-0 top-0 ${additionalClasses}">
+            <clipboard-copy class="ClipboardButton btn m-2 p-0" role="button" style="display: inherit;">
+                <svg height="16" width="16" class="octicon octicon-copy m-2"><path d="${IconList["copy"]}"></path></svg>
+                <svg height="16" width="16" class="octicon octicon-check color-fg-success m-2 d-none"><path d="${IconList["check"]}"></path></svg>
+            </clipboard-copy>
+            <div class="copy-feedback">Copied!</div>
+        </div>
+    `;
+
+    const handleCodeElements = (selector = '') => {
+        document.querySelectorAll(selector).forEach(codeElement => {
+            const codeContent = codeElement.innerHTML;
+            const newStructure = document.createElement('div');
+            newStructure.className = 'snippet-clipboard-content position-relative overflow-auto';
+            newStructure.innerHTML = createClipboardHTML(codeContent);
+
+            const parentElement = codeElement.parentElement;
+            if (selector.includes('highlight')) {
+                parentElement.insertBefore(newStructure, codeElement.nextSibling);
+                parentElement.removeChild(codeElement);
+            } else {
+                parentElement.parentElement.replaceChild(newStructure, parentElement);
+            }
+        });
+    };
+
+    handleCodeElements('pre.notranslate > code.notranslate');
+    handleCodeElements('div.highlight > pre.notranslate');
+
+    let currentFeedback = null;
+    document.querySelectorAll('clipboard-copy').forEach(copyButton => {
+        copyButton.addEventListener('click', () => {
+            const codeContent = copyButton.closest('.snippet-clipboard-content').innerText;
+            const tempTextArea = document.createElement('textarea');
+            tempTextArea.value = codeContent;
+            document.body.appendChild(tempTextArea);
+            tempTextArea.select();
+            document.execCommand('copy');
+            document.body.removeChild(tempTextArea);
+
+            const copyIcon = copyButton.querySelector('.octicon-copy');
+            const checkIcon = copyButton.querySelector('.octicon-check');
+            const copyFeedback = copyButton.nextElementSibling;
+
+            if (currentFeedback && currentFeedback !== copyFeedback) {currentFeedback.style.display = 'none';}
+            currentFeedback = copyFeedback;
+
+            copyIcon.classList.add('d-none');
+            checkIcon.classList.remove('d-none');
+            copyFeedback.style.display = 'block';
+            copyButton.style.borderColor = 'var(--color-success-fg)';
+
+            setTimeout(() => {
+                copyIcon.classList.remove('d-none');
+                checkIcon.classList.add('d-none');
+                copyFeedback.style.display = 'none';
+                copyButton.style.borderColor = '';
+            }, 2000);
+        });
+    });
+});
+
+</script>
+
+
+</html>
