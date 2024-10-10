@@ -1,5 +1,4 @@
 
-
 Databases, Big Data, and Stream Processors have long had the property that it can be hard to *demonstrate* their value, like in a demo setting.
 Databases coordinate the work of multiple teams of independent workers, and don't shine when there is just one user.
 Big Data systems introduce scalable patterns that can be purely overhead when the data fit on a single laptop.
