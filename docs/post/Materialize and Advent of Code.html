@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html data-color-mode="light" data-dark-theme="dark" data-light-theme="light" lang="zh-CN">
+<head>
+    <meta content="text/html; charset=utf-8" http-equiv="content-type" />
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <link href='https://mirrors.sustech.edu.cn/cdnjs/ajax/libs/Primer/21.0.7/primer.css' rel='stylesheet' />
+    
+    <link rel="icon" href="https://github.githubassets.com/favicons/favicon.svg"><script>
+        let theme = localStorage.getItem("meek_theme") || "light";
+        document.documentElement.setAttribute("data-color-mode", theme);
+    </script>
+<meta name="description" content="
+
+This past year Team Materialize struck out to do each day of 2023's [Advent of Code](https://adventofcode.com/2023), an annual programming event with thought-provoking problems that you are encouraged to approach from non-standard directions.
+We figured we'd try and use SQL for the whole thing.
+
+SQL is a bold choice because it is meant for querying data, and not as much for general computation.
+Several of the problems call for interesting algorithms, specific data structures, and some flexibility.
+However, Materialize's core thesis is that you can do so much more with SQL that just query your data.
+If you want to move operational logic from bespoke code into SQL, you'll need to be able to express that logic.
+And so, Advent of Code was a great opportunity to stretch our legs, and fingers, and see just how much logic fits into SQL.
+
+### Preliminaries
+
+There's a lot of content in the month's problems.
+There are 49 problems, and although there is some overlap really there is too much to say about all of them.
+We aren't going to recount each of the problems, the whimsical backstories, and the shape of the problem inputs.
+We'll try and flag some surprising moments, though, and you should dive into those problems if you are keen (they can each be done on their own).
+
+I (Frank) wrote all of my solutions using Materialize's `WITH MUTUALLY RECURSIVE` even when recursion was not required.
+This just helped me start writing, as the blocks allow you to just start naming subqueries and writing SQL.
+
+My solutions all had the same skeletal structure:
+```sql
+WITH MUTUALLY RECURSIVE
+
+    -- Parse the problem input into tabular form.
+    lines(line TEXT) AS ( .. ),
+
+    -- SQL leading up to part 1.
+    part1(part1 BIGINT) AS ( .. ),
+
+    -- SQL leading up to part 2.
+    part2(part2 BIGINT) AS ( .. ) 
+
+SELECT * FROM part1, part2;
+```
+
+As mentioned, we won't always need recursion.
+However, we often do use recursion, and may even need it.
+We'll call this out, as the use (and ease) of recursion in SQL was one of the main unlocks.
+
+### Week one
+
+[Day one](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1201.md) was largely about text manipulation, specifically extracting numbers from text, and was well-addressed by using regular expressions to manipulate and search the text. 
+
+[Day two](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1202.md) was largely about aggregation: rolling up counts and maxima for games involving numbers of colored cubes; SQL did great here.
+
+[Day three](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1203.md) has inputs in grid form, where there can be interaction between multiple lines (with symbols above or below others). 
+You are looking for runs of numerals, and I used `WMR` to track these down; reportedly you can also use regular expressions, but I was not clever enough for that!
+
+[Day four](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week4/aoc_1225.md) introduced scratch cards where each line of input has some winners and losers. 
+This was easy SQL until part two, in which winners give you other scratch cards, which have winners that give you other scratch cards, which .. you can see the recursion. 
+Despite being wordy and complicated, the SQL isn't so bad:
+```sql
+    -- PART 2
+    -- Each card provides a copy of the next `score` cards.
+    expanded(card INT, score BIGINT) AS (
+        SELECT * FROM matches
+        UNION ALL
+        SELECT
+            matches.card,
+            matches.score
+        FROM
+            expanded,
+            matches,
+            generate_series(1, expanded.score) as step
+        WHERE
+            expanded.card + step = matches.card
+    ),
+    part2(part2 BIGINT) AS ( SELECT COUNT(*) FROM expanded)
+```
+This would be tricky to do with non-recursive SQL, as the data itself tells us how to unfold the results.
+Hooray for recursion!
+
+[Day five](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1205.md) was a bit of a bear.
+It was the same day we were doing a Materialize on-site and we were all a bit distracted, but also it was pretty beefy. 
+You first have to 'route' various elements through a sequence of remappings, whose length is defined in the data.
+You then have to expand that out to routing whole intervals (rather than elements), and .. there is just lots of potential for error.
+I used recursive SQL to handle all the remapping, but other folks just expanded out their SQL for each of the (ten-ish) remappings.
+
+[Day six](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1206.md) was about whether you knew (or were willing to learn about) the [quadratic formula](https://en.wikipedia.org/wiki/Quadratic_formula).
+
+[Day seven](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1207.md) is about scoring poker hands, using some new rules for tie breaking. 
+This was mostly SQL aggregation, as the numbers of each card in each hand largely determine the outcome, other than tie-breaking where I learned about the [`translate`](https://materialize.com/docs/sql/functions/#translate) function.
+
+### Week two
+
+[Day eight](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1208.md) involved some graph navigation (recursion), and some mathematics.
+The mathematics were of the form 'notice that various things are relatively prime', and it was important to rely on SQL as a tool to support reasoning, as opposed to directly attacking the specified computation.
+In this case, my problem called for 14,935,034,899,483 steps, and no tool is going to make direct simulation be the right answer.
+
+[Day nine](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1209.md) was a refreshing introduction to polynomials, and how if you take enough derivatives of them they end up at zero.
+The task was to do this, repeatedly difference adjacent measurements, or adjacent differences, etc., until you get all zeros.
+Then, integrate back up to get projections in the forward and reverse direction.
+I used recursion here to accommodate the unknown degree of the polynomial (somewhere in the twenties).
+
+[Day ten](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1210.md) presents you with a grid of pipe (symbols `|`, `-`, `J`, `7`, `F`, and `L`), and questions about how long a loop of pipe is, and then how many cells are contained within it. The first part involved recursion, and I used it again for a dynamic programming solution to the second part.
+
+[Day eleven](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1211.md) presents a grid of 'galaxies' and has you calculate the distance between pairs (the L1 or 'Manhattan' distance, always the sum of absolute values of coordinate differences). 
+Parts one and two were the same, but with different magnitudes of numbers.
+No recursion here!
+
+[Day twelve](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1211.md) was about sequence alignment, matching partial observations with hard constraints.
+Dynamic programming was a great solution here, using recursion.
+
+[Day thirteen](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1213.md) had grids of observations with the hypothesis that each is mirrored, horizontally or vertically, at some point that you need to find.
+SQL and subqueries were a great way to validate hypothetical mirroring axes.
+
+[Day fourteen](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1214.md) was a treat, in that it used *nested* recursion: a `WMR` block within a `WMR` block.
+The problem was simulation of rocks that roll in cardinal directions, changing the direction ninety degrees, and repeating.
+Each simulation was recursive (rocks roll until they stop), and we were meant to repeat the larger progress a great many times (1,000,000,000 cycles).
+The only bummer here was the amount of copy/paste re-use, as each of the four cardinal directions had different subqueries.
+
+### Week three
+
+[Day fifteen](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1215.md) has you implement a hash function, and then a hash map.
+Recursion was a handy way to walk through the input to be hashed, though the hash function was simple enough that you could have used math directly instead. 
+The second part (the hash map) did not require recursion, as rather than simulate the operations you could leap to the final state you were looking for.
+
+[Day sixteen](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1216.md) was about bouncing light around in a grid, and seeing how many grid cells are illuminated.
+The illumination process was classic recursive SQL, where you keep expanding `(row, col, dir)` triples until the set reaches a fixed point.
+In the second part the light sources had an origin, which is just a fourth column to add, tracking the source of each ray of light.
+
+[Day seventeen](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1217.md) is a pathfinding problem, with constraints on how you move around the path (not too short or too long in any direction at once).
+Classic recursive SQL to implement [Bellman-Ford](https://en.wikipedia.org/wiki/Bellman–Ford_algorithm).
+
+[Day eighteen](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1218.md) provides instructions of how a digger will move around, excavating earth, and asks you to calculate the area.
+This is an opportunity to learn about the [Trapezoid formula](https://en.wikipedia.org/wiki/Shoelace_formula#Trapezoid_formula) for computing the area as the addition and subtraction of trapezoid areas.
+
+[Day nineteen](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1219.md) sneakily introduces you to [binary space partitioning](https://en.wikipedia.org/wiki/Binary_space_partitioning), where rules based on inequality tests route you to new rules, until eventually you reach some rule that says 'accept' or 'reject'.
+This was all pretty easy, except for a substantial amount of SQL overhead related to the various symbols and characters and coordinates all of which required their own columns.
+
+[Day twenty](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1220.md) presents you with the simulation of an asynchronous circuit, and this is the day that almost broke me.
+Mechanically the SQL isn't that complicated, but *debugging* the SQL was a real challenge.
+It got done over the course of a quite long train ride into the evening.
+
+[Day twenty-one](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1221.md) was another example of some (recursive) SQL for grid exploration, followed by some mathematics.
+In this case the grid exploration was standard, determining reachable locations on the grid, and then the math was quadratic extrapolation from a sequence of measurements (to something too large to actually evaluate, an answer of 621,289,922,886,149 reachable states).
+
+### Week four
+
+The last week was shorter, but also culminated in some pretty exciting problems and techniques.
+
+[Day twenty-two](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week4/aoc_1222.md) had shapes made of cubes falling into a well, and coming to rest on others (or the ground).
+There were then questions about how many pieces are load bearing, and also for each load bearing piece how many others would fall if they were removed.
+Dropping the pieces used recursive SQL, determining the load bearing pieces did not, but then scoring the load bearing pieces again required recursion.
+
+[Day twenty-three](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week4/aoc_1223.md) is a classic example of finding the 'longest path' in a directed graph.
+This is a relatively easy problem when the input is acyclic (part one), and it is NP-hard when the input may have cycles (part two).
+Part one was a mostly vanilla recursive SQL query, and part two encoded the 32 prior state options in a large integer and just did a lot of work.
+
+[Day twenty-four](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week4/aoc_1224.md) had most folks reach for a numerical solver, something like Mathematica or z3.
+That is less easy in SQL, and I needed to learn some math instead (specifically how to find the intersection of two line segments).
+Although part two seemed quite complex, it ended up being relatively easy when you realize a few simplifications (an added dimension that can be ignored until the end, allowing you to re-use part one).
+
+[Day twenty-five](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week4/aoc_1225.md) asked for a minimum graph cut (of three edges).
+This is a standard optimization problem, but rather than try to implement the [Stoer-Wagner algorithm](https://en.wikipedia.org/wiki/Stoer–Wagner_algorithm) I went with something from my PhD thesis: partitioning the graph based on the [Fiedler vector](https://en.wikipedia.org/wiki/Algebraic_connectivity#Fiedler_vector).
+It turns out this gave the right answer on the first try, and the holidays were saved!
+
+## Conclusions
+
+The exercise was certainly helpful and informative, on multiple levels.
+
+First, it really reinforced for me that `WITH MUTUALLY RECURSIVE` is a very valuable tool to have access to when faced with a new problem.
+Often your problem is a bunch of joins and reductions, but when it isn't you are immediately in a bit of a pickle.
+In most cases, algorithmic challenges immediately gave way to recursive SQL.
+
+That being said, there's clearly an accessibility gap when reaching for recursive SQL.
+I find the idioms approachable, but I've spent a while working with data-parallel algorithms, and have seen several of the tricks.
+There's still plenty of work to do before the casual SQL author feels comfortable with recursive SQL.
+
+Second, the majority of my time was spent *debugging* rather than authoring.
+This is a classic challenge with declaritive languages, who go from input program to output data in often inscrutable ways.
+I borrowed some techniques from [debugging Datalog](https://yanniss.github.io/DeclarativeDebugging.pdf), but ideally the system itself would help me with this (and several research systems do provide integrated lineage).
+
+Debugging the logic of SQL queries only gets harder when the data are changing underneath you.
+Techniques like spot checking data become infeasible when the data changes faster than you can observe records that are meant to line up.
+Materialize should help in these cases, with maintained diagnostic views that represent assertions, or better violations thereof, whose contents spell out records that at some moment violated something that was meant to be true.
+Materialize's `SUBSCRIBE` provides a full account of these views, reporting records that existed even for a moment, where anything other than 'always empty' represents an error in your SQL (or your assertions).
+
+Third, using Materialize in new and weird ways shook out several bugs.
+We've already fixed them.
+Dogfooding your own product, especially in surprising contexts, is a great way to forcibly increase your test coverage.
+Issues ranged from the silly ('why would you name a table `count`?') to the abstruse (doubly nested recursive SQL blocks), but they spilled out in the early days and became less frequent as the weeks went on.
+
+Finally, the main conclusion was that it was all possible.
+Despite substantial anxiety about whether and when we would need to bail out, defeated, the whole project did work out.
+We were able to express a rich variety of computational tasks as data-driven SQL both expressed and maintained by Materialize.
+<!-- ##{'timestamp':1704171600}## -->。">
+<meta property="og:title" content="Materialize and Advent of Code">
+<meta property="og:description" content="
+
+This past year Team Materialize struck out to do each day of 2023's [Advent of Code](https://adventofcode.com/2023), an annual programming event with thought-provoking problems that you are encouraged to approach from non-standard directions.
+We figured we'd try and use SQL for the whole thing.
+
+SQL is a bold choice because it is meant for querying data, and not as much for general computation.
+Several of the problems call for interesting algorithms, specific data structures, and some flexibility.
+However, Materialize's core thesis is that you can do so much more with SQL that just query your data.
+If you want to move operational logic from bespoke code into SQL, you'll need to be able to express that logic.
+And so, Advent of Code was a great opportunity to stretch our legs, and fingers, and see just how much logic fits into SQL.
+
+### Preliminaries
+
+There's a lot of content in the month's problems.
+There are 49 problems, and although there is some overlap really there is too much to say about all of them.
+We aren't going to recount each of the problems, the whimsical backstories, and the shape of the problem inputs.
+We'll try and flag some surprising moments, though, and you should dive into those problems if you are keen (they can each be done on their own).
+
+I (Frank) wrote all of my solutions using Materialize's `WITH MUTUALLY RECURSIVE` even when recursion was not required.
+This just helped me start writing, as the blocks allow you to just start naming subqueries and writing SQL.
+
+My solutions all had the same skeletal structure:
+```sql
+WITH MUTUALLY RECURSIVE
+
+    -- Parse the problem input into tabular form.
+    lines(line TEXT) AS ( .. ),
+
+    -- SQL leading up to part 1.
+    part1(part1 BIGINT) AS ( .. ),
+
+    -- SQL leading up to part 2.
+    part2(part2 BIGINT) AS ( .. ) 
+
+SELECT * FROM part1, part2;
+```
+
+As mentioned, we won't always need recursion.
+However, we often do use recursion, and may even need it.
+We'll call this out, as the use (and ease) of recursion in SQL was one of the main unlocks.
+
+### Week one
+
+[Day one](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1201.md) was largely about text manipulation, specifically extracting numbers from text, and was well-addressed by using regular expressions to manipulate and search the text. 
+
+[Day two](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1202.md) was largely about aggregation: rolling up counts and maxima for games involving numbers of colored cubes; SQL did great here.
+
+[Day three](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1203.md) has inputs in grid form, where there can be interaction between multiple lines (with symbols above or below others). 
+You are looking for runs of numerals, and I used `WMR` to track these down; reportedly you can also use regular expressions, but I was not clever enough for that!
+
+[Day four](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week4/aoc_1225.md) introduced scratch cards where each line of input has some winners and losers. 
+This was easy SQL until part two, in which winners give you other scratch cards, which have winners that give you other scratch cards, which .. you can see the recursion. 
+Despite being wordy and complicated, the SQL isn't so bad:
+```sql
+    -- PART 2
+    -- Each card provides a copy of the next `score` cards.
+    expanded(card INT, score BIGINT) AS (
+        SELECT * FROM matches
+        UNION ALL
+        SELECT
+            matches.card,
+            matches.score
+        FROM
+            expanded,
+            matches,
+            generate_series(1, expanded.score) as step
+        WHERE
+            expanded.card + step = matches.card
+    ),
+    part2(part2 BIGINT) AS ( SELECT COUNT(*) FROM expanded)
+```
+This would be tricky to do with non-recursive SQL, as the data itself tells us how to unfold the results.
+Hooray for recursion!
+
+[Day five](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1205.md) was a bit of a bear.
+It was the same day we were doing a Materialize on-site and we were all a bit distracted, but also it was pretty beefy. 
+You first have to 'route' various elements through a sequence of remappings, whose length is defined in the data.
+You then have to expand that out to routing whole intervals (rather than elements), and .. there is just lots of potential for error.
+I used recursive SQL to handle all the remapping, but other folks just expanded out their SQL for each of the (ten-ish) remappings.
+
+[Day six](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1206.md) was about whether you knew (or were willing to learn about) the [quadratic formula](https://en.wikipedia.org/wiki/Quadratic_formula).
+
+[Day seven](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1207.md) is about scoring poker hands, using some new rules for tie breaking. 
+This was mostly SQL aggregation, as the numbers of each card in each hand largely determine the outcome, other than tie-breaking where I learned about the [`translate`](https://materialize.com/docs/sql/functions/#translate) function.
+
+### Week two
+
+[Day eight](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1208.md) involved some graph navigation (recursion), and some mathematics.
+The mathematics were of the form 'notice that various things are relatively prime', and it was important to rely on SQL as a tool to support reasoning, as opposed to directly attacking the specified computation.
+In this case, my problem called for 14,935,034,899,483 steps, and no tool is going to make direct simulation be the right answer.
+
+[Day nine](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1209.md) was a refreshing introduction to polynomials, and how if you take enough derivatives of them they end up at zero.
+The task was to do this, repeatedly difference adjacent measurements, or adjacent differences, etc., until you get all zeros.
+Then, integrate back up to get projections in the forward and reverse direction.
+I used recursion here to accommodate the unknown degree of the polynomial (somewhere in the twenties).
+
+[Day ten](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1210.md) presents you with a grid of pipe (symbols `|`, `-`, `J`, `7`, `F`, and `L`), and questions about how long a loop of pipe is, and then how many cells are contained within it. The first part involved recursion, and I used it again for a dynamic programming solution to the second part.
+
+[Day eleven](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1211.md) presents a grid of 'galaxies' and has you calculate the distance between pairs (the L1 or 'Manhattan' distance, always the sum of absolute values of coordinate differences). 
+Parts one and two were the same, but with different magnitudes of numbers.
+No recursion here!
+
+[Day twelve](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1211.md) was about sequence alignment, matching partial observations with hard constraints.
+Dynamic programming was a great solution here, using recursion.
+
+[Day thirteen](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1213.md) had grids of observations with the hypothesis that each is mirrored, horizontally or vertically, at some point that you need to find.
+SQL and subqueries were a great way to validate hypothetical mirroring axes.
+
+[Day fourteen](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1214.md) was a treat, in that it used *nested* recursion: a `WMR` block within a `WMR` block.
+The problem was simulation of rocks that roll in cardinal directions, changing the direction ninety degrees, and repeating.
+Each simulation was recursive (rocks roll until they stop), and we were meant to repeat the larger progress a great many times (1,000,000,000 cycles).
+The only bummer here was the amount of copy/paste re-use, as each of the four cardinal directions had different subqueries.
+
+### Week three
+
+[Day fifteen](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1215.md) has you implement a hash function, and then a hash map.
+Recursion was a handy way to walk through the input to be hashed, though the hash function was simple enough that you could have used math directly instead. 
+The second part (the hash map) did not require recursion, as rather than simulate the operations you could leap to the final state you were looking for.
+
+[Day sixteen](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1216.md) was about bouncing light around in a grid, and seeing how many grid cells are illuminated.
+The illumination process was classic recursive SQL, where you keep expanding `(row, col, dir)` triples until the set reaches a fixed point.
+In the second part the light sources had an origin, which is just a fourth column to add, tracking the source of each ray of light.
+
+[Day seventeen](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1217.md) is a pathfinding problem, with constraints on how you move around the path (not too short or too long in any direction at once).
+Classic recursive SQL to implement [Bellman-Ford](https://en.wikipedia.org/wiki/Bellman–Ford_algorithm).
+
+[Day eighteen](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1218.md) provides instructions of how a digger will move around, excavating earth, and asks you to calculate the area.
+This is an opportunity to learn about the [Trapezoid formula](https://en.wikipedia.org/wiki/Shoelace_formula#Trapezoid_formula) for computing the area as the addition and subtraction of trapezoid areas.
+
+[Day nineteen](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1219.md) sneakily introduces you to [binary space partitioning](https://en.wikipedia.org/wiki/Binary_space_partitioning), where rules based on inequality tests route you to new rules, until eventually you reach some rule that says 'accept' or 'reject'.
+This was all pretty easy, except for a substantial amount of SQL overhead related to the various symbols and characters and coordinates all of which required their own columns.
+
+[Day twenty](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1220.md) presents you with the simulation of an asynchronous circuit, and this is the day that almost broke me.
+Mechanically the SQL isn't that complicated, but *debugging* the SQL was a real challenge.
+It got done over the course of a quite long train ride into the evening.
+
+[Day twenty-one](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1221.md) was another example of some (recursive) SQL for grid exploration, followed by some mathematics.
+In this case the grid exploration was standard, determining reachable locations on the grid, and then the math was quadratic extrapolation from a sequence of measurements (to something too large to actually evaluate, an answer of 621,289,922,886,149 reachable states).
+
+### Week four
+
+The last week was shorter, but also culminated in some pretty exciting problems and techniques.
+
+[Day twenty-two](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week4/aoc_1222.md) had shapes made of cubes falling into a well, and coming to rest on others (or the ground).
+There were then questions about how many pieces are load bearing, and also for each load bearing piece how many others would fall if they were removed.
+Dropping the pieces used recursive SQL, determining the load bearing pieces did not, but then scoring the load bearing pieces again required recursion.
+
+[Day twenty-three](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week4/aoc_1223.md) is a classic example of finding the 'longest path' in a directed graph.
+This is a relatively easy problem when the input is acyclic (part one), and it is NP-hard when the input may have cycles (part two).
+Part one was a mostly vanilla recursive SQL query, and part two encoded the 32 prior state options in a large integer and just did a lot of work.
+
+[Day twenty-four](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week4/aoc_1224.md) had most folks reach for a numerical solver, something like Mathematica or z3.
+That is less easy in SQL, and I needed to learn some math instead (specifically how to find the intersection of two line segments).
+Although part two seemed quite complex, it ended up being relatively easy when you realize a few simplifications (an added dimension that can be ignored until the end, allowing you to re-use part one).
+
+[Day twenty-five](https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week4/aoc_1225.md) asked for a minimum graph cut (of three edges).
+This is a standard optimization problem, but rather than try to implement the [Stoer-Wagner algorithm](https://en.wikipedia.org/wiki/Stoer–Wagner_algorithm) I went with something from my PhD thesis: partitioning the graph based on the [Fiedler vector](https://en.wikipedia.org/wiki/Algebraic_connectivity#Fiedler_vector).
+It turns out this gave the right answer on the first try, and the holidays were saved!
+
+## Conclusions
+
+The exercise was certainly helpful and informative, on multiple levels.
+
+First, it really reinforced for me that `WITH MUTUALLY RECURSIVE` is a very valuable tool to have access to when faced with a new problem.
+Often your problem is a bunch of joins and reductions, but when it isn't you are immediately in a bit of a pickle.
+In most cases, algorithmic challenges immediately gave way to recursive SQL.
+
+That being said, there's clearly an accessibility gap when reaching for recursive SQL.
+I find the idioms approachable, but I've spent a while working with data-parallel algorithms, and have seen several of the tricks.
+There's still plenty of work to do before the casual SQL author feels comfortable with recursive SQL.
+
+Second, the majority of my time was spent *debugging* rather than authoring.
+This is a classic challenge with declaritive languages, who go from input program to output data in often inscrutable ways.
+I borrowed some techniques from [debugging Datalog](https://yanniss.github.io/DeclarativeDebugging.pdf), but ideally the system itself would help me with this (and several research systems do provide integrated lineage).
+
+Debugging the logic of SQL queries only gets harder when the data are changing underneath you.
+Techniques like spot checking data become infeasible when the data changes faster than you can observe records that are meant to line up.
+Materialize should help in these cases, with maintained diagnostic views that represent assertions, or better violations thereof, whose contents spell out records that at some moment violated something that was meant to be true.
+Materialize's `SUBSCRIBE` provides a full account of these views, reporting records that existed even for a moment, where anything other than 'always empty' represents an error in your SQL (or your assertions).
+
+Third, using Materialize in new and weird ways shook out several bugs.
+We've already fixed them.
+Dogfooding your own product, especially in surprising contexts, is a great way to forcibly increase your test coverage.
+Issues ranged from the silly ('why would you name a table `count`?') to the abstruse (doubly nested recursive SQL blocks), but they spilled out in the early days and became less frequent as the weeks went on.
+
+Finally, the main conclusion was that it was all possible.
+Despite substantial anxiety about whether and when we would need to bail out, defeated, the whole project did work out.
+We were able to express a rich variety of computational tasks as data-driven SQL both expressed and maintained by Materialize.
+<!-- ##{'timestamp':1704171600}## -->。">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://nuowoo.github.io/blog/post/Materialize%20and%20Advent%20of%20Code.html">
+<meta property="og:image" content="https://github.githubassets.com/favicons/favicon.svg">
+<title>Materialize and Advent of Code</title>
+<link href="//unpkg.com/@wooorm/starry-night@2.1.1/style/both.css" rel="stylesheet" />
+
+
+</head>
+<style>
+body{box-sizing: border-box;min-width: 200px;max-width: 900px;margin: 20px auto;padding: 45px;font-size: 16px;font-family: sans-serif;line-height: 1.25;}
+#header{display:flex;padding-bottom:8px;border-bottom: 1px solid var(--borderColor-muted, var(--color-border-muted));margin-bottom: 16px;}
+#footer {margin-top:64px; text-align: center;font-size: small;}
+
+</style>
+
+<style>
+.postTitle{margin: auto 0;font-size:40px;font-weight:bold;}
+.title-right{display:flex;margin:auto 0 0 auto;}
+.title-right .circle{padding: 14px 16px;margin-right:8px;}
+#postBody{border-bottom: 1px solid var(--color-border-default);padding-bottom:36px;}
+#postBody hr{height:2px;}
+#cmButton{height:48px;margin-top:48px;}
+#comments{margin-top:64px;}
+.g-emoji{font-size:24px;}
+@media (max-width: 600px) {
+    body {padding: 8px;}
+    .postTitle{font-size:24px;}
+}
+.copy-feedback {
+    display: none;
+    position: absolute;
+    top: 10px;
+    right: 50px;
+    color: var(--color-fg-on-emphasis);
+    background-color: var(--color-fg-muted);
+    border-radius: 3px;
+    padding: 5px 8px;
+    font-size: 12px;
+}
+</style>
+
+
+
+
+<body>
+    <div id="header">
+<h1 class="postTitle">Materialize and Advent of Code</h1>
+<div class="title-right">
+    <a href="https://nuowoo.github.io/blog" id="buttonHome" class="btn btn-invisible circle" title="首页">
+        <svg class="octicon" width="16" height="16">
+            <path id="pathHome" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+    
+    <a href="https://github.com/nuowoo/blog/issues/4" target="_blank" class="btn btn-invisible circle" title="Issue">
+        <svg class="octicon" width="16" height="16">
+            <path id="pathIssue" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+    
+
+    <a class="btn btn-invisible circle" onclick="modeSwitch();" title="切换主题">
+        <svg class="octicon" width="16" height="16" >
+            <path id="themeSwitch" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+
+</div>
+</div>
+    <div id="content">
+<div class="markdown-body" id="postBody"><p>This past year Team Materialize struck out to do each day of 2023's <a href="https://adventofcode.com/2023" rel="nofollow">Advent of Code</a>, an annual programming event with thought-provoking problems that you are encouraged to approach from non-standard directions.<br>
+We figured we'd try and use SQL for the whole thing.</p>
+<p>SQL is a bold choice because it is meant for querying data, and not as much for general computation.<br>
+Several of the problems call for interesting algorithms, specific data structures, and some flexibility.<br>
+However, Materialize's core thesis is that you can do so much more with SQL that just query your data.<br>
+If you want to move operational logic from bespoke code into SQL, you'll need to be able to express that logic.<br>
+And so, Advent of Code was a great opportunity to stretch our legs, and fingers, and see just how much logic fits into SQL.</p>
+<h3>Preliminaries</h3>
+<p>There's a lot of content in the month's problems.<br>
+There are 49 problems, and although there is some overlap really there is too much to say about all of them.<br>
+We aren't going to recount each of the problems, the whimsical backstories, and the shape of the problem inputs.<br>
+We'll try and flag some surprising moments, though, and you should dive into those problems if you are keen (they can each be done on their own).</p>
+<p>I (Frank) wrote all of my solutions using Materialize's <code class="notranslate">WITH MUTUALLY RECURSIVE</code> even when recursion was not required.<br>
+This just helped me start writing, as the blocks allow you to just start naming subqueries and writing SQL.</p>
+<p>My solutions all had the same skeletal structure:</p>
+<div class="highlight highlight-source-sql"><pre class="notranslate">WITH MUTUALLY RECURSIVE
+
+    <span class="pl-c"><span class="pl-c">--</span> Parse the problem input into tabular form.</span>
+    lines(<span class="pl-k">line</span> <span class="pl-k">TEXT</span>) <span class="pl-k">AS</span> ( .. ),
+
+    <span class="pl-c"><span class="pl-c">--</span> SQL leading up to part 1.</span>
+    part1(part1 <span class="pl-k">BIGINT</span>) <span class="pl-k">AS</span> ( .. ),
+
+    <span class="pl-c"><span class="pl-c">--</span> SQL leading up to part 2.</span>
+    part2(part2 <span class="pl-k">BIGINT</span>) <span class="pl-k">AS</span> ( .. ) 
+
+<span class="pl-k">SELECT</span> <span class="pl-k">*</span> <span class="pl-k">FROM</span> part1, part2;</pre></div>
+<p>As mentioned, we won't always need recursion.<br>
+However, we often do use recursion, and may even need it.<br>
+We'll call this out, as the use (and ease) of recursion in SQL was one of the main unlocks.</p>
+<h3>Week one</h3>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1201.md">Day one</a> was largely about text manipulation, specifically extracting numbers from text, and was well-addressed by using regular expressions to manipulate and search the text.</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1202.md">Day two</a> was largely about aggregation: rolling up counts and maxima for games involving numbers of colored cubes; SQL did great here.</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1203.md">Day three</a> has inputs in grid form, where there can be interaction between multiple lines (with symbols above or below others).<br>
+You are looking for runs of numerals, and I used <code class="notranslate">WMR</code> to track these down; reportedly you can also use regular expressions, but I was not clever enough for that!</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week4/aoc_1225.md">Day four</a> introduced scratch cards where each line of input has some winners and losers.<br>
+This was easy SQL until part two, in which winners give you other scratch cards, which have winners that give you other scratch cards, which .. you can see the recursion.<br>
+Despite being wordy and complicated, the SQL isn't so bad:</p>
+<div class="highlight highlight-source-sql"><pre class="notranslate">    <span class="pl-c"><span class="pl-c">--</span> PART 2</span>
+    <span class="pl-c"><span class="pl-c">--</span> Each card provides a copy of the next `score` cards.</span>
+    expanded(card <span class="pl-k">INT</span>, score <span class="pl-k">BIGINT</span>) <span class="pl-k">AS</span> (
+        <span class="pl-k">SELECT</span> <span class="pl-k">*</span> <span class="pl-k">FROM</span> matches
+        <span class="pl-k">UNION ALL</span>
+        <span class="pl-k">SELECT</span>
+            <span class="pl-c1">matches</span>.<span class="pl-c1">card</span>,
+            <span class="pl-c1">matches</span>.<span class="pl-c1">score</span>
+        <span class="pl-k">FROM</span>
+            expanded,
+            matches,
+            generate_series(<span class="pl-c1">1</span>, <span class="pl-c1">expanded</span>.<span class="pl-c1">score</span>) <span class="pl-k">as</span> step
+        <span class="pl-k">WHERE</span>
+            <span class="pl-c1">expanded</span>.<span class="pl-c1">card</span> <span class="pl-k">+</span> step <span class="pl-k">=</span> <span class="pl-c1">matches</span>.<span class="pl-c1">card</span>
+    ),
+    part2(part2 <span class="pl-k">BIGINT</span>) <span class="pl-k">AS</span> ( <span class="pl-k">SELECT</span> <span class="pl-c1">COUNT</span>(<span class="pl-k">*</span>) <span class="pl-k">FROM</span> expanded)</pre></div>
+<p>This would be tricky to do with non-recursive SQL, as the data itself tells us how to unfold the results.<br>
+Hooray for recursion!</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1205.md">Day five</a> was a bit of a bear.<br>
+It was the same day we were doing a Materialize on-site and we were all a bit distracted, but also it was pretty beefy.<br>
+You first have to "route" various elements through a sequence of remappings, whose length is defined in the data.<br>
+You then have to expand that out to routing whole intervals (rather than elements), and .. there is just lots of potential for error.<br>
+I used recursive SQL to handle all the remapping, but other folks just expanded out their SQL for each of the (ten-ish) remappings.</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1206.md">Day six</a> was about whether you knew (or were willing to learn about) the <a href="https://en.wikipedia.org/wiki/Quadratic_formula" rel="nofollow">quadratic formula</a>.</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week1/aoc_1207.md">Day seven</a> is about scoring poker hands, using some new rules for tie breaking.<br>
+This was mostly SQL aggregation, as the numbers of each card in each hand largely determine the outcome, other than tie-breaking where I learned about the <a href="https://materialize.com/docs/sql/functions/#translate" rel="nofollow"><code class="notranslate">translate</code></a> function.</p>
+<h3>Week two</h3>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1208.md">Day eight</a> involved some graph navigation (recursion), and some mathematics.<br>
+The mathematics were of the form "notice that various things are relatively prime", and it was important to rely on SQL as a tool to support reasoning, as opposed to directly attacking the specified computation.<br>
+In this case, my problem called for 14,935,034,899,483 steps, and no tool is going to make direct simulation be the right answer.</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1209.md">Day nine</a> was a refreshing introduction to polynomials, and how if you take enough derivatives of them they end up at zero.<br>
+The task was to do this, repeatedly difference adjacent measurements, or adjacent differences, etc., until you get all zeros.<br>
+Then, integrate back up to get projections in the forward and reverse direction.<br>
+I used recursion here to accommodate the unknown degree of the polynomial (somewhere in the twenties).</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1210.md">Day ten</a> presents you with a grid of pipe (symbols <code class="notranslate">|</code>, <code class="notranslate">-</code>, <code class="notranslate">J</code>, <code class="notranslate">7</code>, <code class="notranslate">F</code>, and <code class="notranslate">L</code>), and questions about how long a loop of pipe is, and then how many cells are contained within it. The first part involved recursion, and I used it again for a dynamic programming solution to the second part.</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1211.md">Day eleven</a> presents a grid of "galaxies" and has you calculate the distance between pairs (the L1 or "Manhattan" distance, always the sum of absolute values of coordinate differences).<br>
+Parts one and two were the same, but with different magnitudes of numbers.<br>
+No recursion here!</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1211.md">Day twelve</a> was about sequence alignment, matching partial observations with hard constraints.<br>
+Dynamic programming was a great solution here, using recursion.</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1213.md">Day thirteen</a> had grids of observations with the hypothesis that each is mirrored, horizontally or vertically, at some point that you need to find.<br>
+SQL and subqueries were a great way to validate hypothetical mirroring axes.</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week2/aoc_1214.md">Day fourteen</a> was a treat, in that it used <em>nested</em> recursion: a <code class="notranslate">WMR</code> block within a <code class="notranslate">WMR</code> block.<br>
+The problem was simulation of rocks that roll in cardinal directions, changing the direction ninety degrees, and repeating.<br>
+Each simulation was recursive (rocks roll until they stop), and we were meant to repeat the larger progress a great many times (1,000,000,000 cycles).<br>
+The only bummer here was the amount of copy/paste re-use, as each of the four cardinal directions had different subqueries.</p>
+<h3>Week three</h3>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1215.md">Day fifteen</a> has you implement a hash function, and then a hash map.<br>
+Recursion was a handy way to walk through the input to be hashed, though the hash function was simple enough that you could have used math directly instead.<br>
+The second part (the hash map) did not require recursion, as rather than simulate the operations you could leap to the final state you were looking for.</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1216.md">Day sixteen</a> was about bouncing light around in a grid, and seeing how many grid cells are illuminated.<br>
+The illumination process was classic recursive SQL, where you keep expanding <code class="notranslate">(row, col, dir)</code> triples until the set reaches a fixed point.<br>
+In the second part the light sources had an origin, which is just a fourth column to add, tracking the source of each ray of light.</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1217.md">Day seventeen</a> is a pathfinding problem, with constraints on how you move around the path (not too short or too long in any direction at once).<br>
+Classic recursive SQL to implement <a href="https://en.wikipedia.org/wiki/Bellman%E2%80%93Ford_algorithm" rel="nofollow">Bellman-Ford</a>.</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1218.md">Day eighteen</a> provides instructions of how a digger will move around, excavating earth, and asks you to calculate the area.<br>
+This is an opportunity to learn about the <a href="https://en.wikipedia.org/wiki/Shoelace_formula#Trapezoid_formula" rel="nofollow">Trapezoid formula</a> for computing the area as the addition and subtraction of trapezoid areas.</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1219.md">Day nineteen</a> sneakily introduces you to <a href="https://en.wikipedia.org/wiki/Binary_space_partitioning" rel="nofollow">binary space partitioning</a>, where rules based on inequality tests route you to new rules, until eventually you reach some rule that says "accept" or "reject".<br>
+This was all pretty easy, except for a substantial amount of SQL overhead related to the various symbols and characters and coordinates all of which required their own columns.</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1220.md">Day twenty</a> presents you with the simulation of an asynchronous circuit, and this is the day that almost broke me.<br>
+Mechanically the SQL isn't that complicated, but <em>debugging</em> the SQL was a real challenge.<br>
+It got done over the course of a quite long train ride into the evening.</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week3/aoc_1221.md">Day twenty-one</a> was another example of some (recursive) SQL for grid exploration, followed by some mathematics.<br>
+In this case the grid exploration was standard, determining reachable locations on the grid, and then the math was quadratic extrapolation from a sequence of measurements (to something too large to actually evaluate, an answer of 621,289,922,886,149 reachable states).</p>
+<h3>Week four</h3>
+<p>The last week was shorter, but also culminated in some pretty exciting problems and techniques.</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week4/aoc_1222.md">Day twenty-two</a> had shapes made of cubes falling into a well, and coming to rest on others (or the ground).<br>
+There were then questions about how many pieces are load bearing, and also for each load bearing piece how many others would fall if they were removed.<br>
+Dropping the pieces used recursive SQL, determining the load bearing pieces did not, but then scoring the load bearing pieces again required recursion.</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week4/aoc_1223.md">Day twenty-three</a> is a classic example of finding the "longest path" in a directed graph.<br>
+This is a relatively easy problem when the input is acyclic (part one), and it is NP-hard when the input may have cycles (part two).<br>
+Part one was a mostly vanilla recursive SQL query, and part two encoded the 32 prior state options in a large integer and just did a lot of work.</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week4/aoc_1224.md">Day twenty-four</a> had most folks reach for a numerical solver, something like Mathematica or z3.<br>
+That is less easy in SQL, and I needed to learn some math instead (specifically how to find the intersection of two line segments).<br>
+Although part two seemed quite complex, it ended up being relatively easy when you realize a few simplifications (an added dimension that can be ignored until the end, allowing you to re-use part one).</p>
+<p><a href="https://github.com/MaterializeInc/advent-of-code-2023/blob/main/week4/aoc_1225.md">Day twenty-five</a> asked for a minimum graph cut (of three edges).<br>
+This is a standard optimization problem, but rather than try to implement the <a href="https://en.wikipedia.org/wiki/Stoer%E2%80%93Wagner_algorithm" rel="nofollow">Stoer-Wagner algorithm</a> I went with something from my PhD thesis: partitioning the graph based on the <a href="https://en.wikipedia.org/wiki/Algebraic_connectivity#Fiedler_vector" rel="nofollow">Fiedler vector</a>.<br>
+It turns out this gave the right answer on the first try, and the holidays were saved!</p>
+<h2>Conclusions</h2>
+<p>The exercise was certainly helpful and informative, on multiple levels.</p>
+<p>First, it really reinforced for me that <code class="notranslate">WITH MUTUALLY RECURSIVE</code> is a very valuable tool to have access to when faced with a new problem.<br>
+Often your problem is a bunch of joins and reductions, but when it isn't you are immediately in a bit of a pickle.<br>
+In most cases, algorithmic challenges immediately gave way to recursive SQL.</p>
+<p>That being said, there's clearly an accessibility gap when reaching for recursive SQL.<br>
+I find the idioms approachable, but I've spent a while working with data-parallel algorithms, and have seen several of the tricks.<br>
+There's still plenty of work to do before the casual SQL author feels comfortable with recursive SQL.</p>
+<p>Second, the majority of my time was spent <em>debugging</em> rather than authoring.<br>
+This is a classic challenge with declaritive languages, who go from input program to output data in often inscrutable ways.<br>
+I borrowed some techniques from <a href="https://yanniss.github.io/DeclarativeDebugging.pdf" rel="nofollow">debugging Datalog</a>, but ideally the system itself would help me with this (and several research systems do provide integrated lineage).</p>
+<p>Debugging the logic of SQL queries only gets harder when the data are changing underneath you.<br>
+Techniques like spot checking data become infeasible when the data changes faster than you can observe records that are meant to line up.<br>
+Materialize should help in these cases, with maintained diagnostic views that represent assertions, or better violations thereof, whose contents spell out records that at some moment violated something that was meant to be true.<br>
+Materialize's <code class="notranslate">SUBSCRIBE</code> provides a full account of these views, reporting records that existed even for a moment, where anything other than "always empty" represents an error in your SQL (or your assertions).</p>
+<p>Third, using Materialize in new and weird ways shook out several bugs.<br>
+We've already fixed them.<br>
+Dogfooding your own product, especially in surprising contexts, is a great way to forcibly increase your test coverage.<br>
+Issues ranged from the silly ("why would you name a table <code class="notranslate">count</code>?") to the abstruse (doubly nested recursive SQL blocks), but they spilled out in the early days and became less frequent as the weeks went on.</p>
+<p>Finally, the main conclusion was that it was all possible.<br>
+Despite substantial anxiety about whether and when we would need to bail out, defeated, the whole project did work out.<br>
+We were able to express a rich variety of computational tasks as data-driven SQL both expressed and maintained by Materialize.</p>
+</div>
+<div style="font-size:small;margin-top:8px;float:right;"></div>
+
+<button class="btn btn-block" type="button" onclick="openComments()" id="cmButton">评论</button>
+<div class="comments" id="comments"></div>
+
+</div>
+    <div id="footer"><div id="footer1">Copyright © <span id="copyrightYear"></span> <a href="https://nuowoo.github.io/blog">Computer Scientist</a></div>
+<div id="footer2">
+    <span id="runday"></span><span>Powered by <a href="https://meekdai.com/Gmeek.html" target="_blank">Gmeek</a></span>
+</div>
+
+<script>
+var now=new Date();
+document.getElementById("copyrightYear").innerHTML=now.getFullYear();
+
+if(""!=""){
+    var startSite=new Date("");
+    var diff=now.getTime()-startSite.getTime();
+    var diffDay=Math.floor(diff/(1000*60*60*24));
+    document.getElementById("runday").innerHTML="网站运行"+diffDay+"天"+" • ";
+}
+</script></div>
+</body>
+<script>
+var IconList={'sun': 'M8 10.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5zM8 12a4 4 0 100-8 4 4 0 000 8zM8 0a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0V.75A.75.75 0 018 0zm0 13a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0v-1.5A.75.75 0 018 13zM2.343 2.343a.75.75 0 011.061 0l1.06 1.061a.75.75 0 01-1.06 1.06l-1.06-1.06a.75.75 0 010-1.06zm9.193 9.193a.75.75 0 011.06 0l1.061 1.06a.75.75 0 01-1.06 1.061l-1.061-1.06a.75.75 0 010-1.061zM16 8a.75.75 0 01-.75.75h-1.5a.75.75 0 010-1.5h1.5A.75.75 0 0116 8zM3 8a.75.75 0 01-.75.75H.75a.75.75 0 010-1.5h1.5A.75.75 0 013 8zm10.657-5.657a.75.75 0 010 1.061l-1.061 1.06a.75.75 0 11-1.06-1.06l1.06-1.06a.75.75 0 011.06 0zm-9.193 9.193a.75.75 0 010 1.06l-1.06 1.061a.75.75 0 11-1.061-1.06l1.06-1.061a.75.75 0 011.061 0z', 'moon': 'M9.598 1.591a.75.75 0 01.785-.175 7 7 0 11-8.967 8.967.75.75 0 01.961-.96 5.5 5.5 0 007.046-7.046.75.75 0 01.175-.786zm1.616 1.945a7 7 0 01-7.678 7.678 5.5 5.5 0 107.678-7.678z', 'sync': 'M1.705 8.005a.75.75 0 0 1 .834.656 5.5 5.5 0 0 0 9.592 2.97l-1.204-1.204a.25.25 0 0 1 .177-.427h3.646a.25.25 0 0 1 .25.25v3.646a.25.25 0 0 1-.427.177l-1.38-1.38A7.002 7.002 0 0 1 1.05 8.84a.75.75 0 0 1 .656-.834ZM8 2.5a5.487 5.487 0 0 0-4.131 1.869l1.204 1.204A.25.25 0 0 1 4.896 6H1.25A.25.25 0 0 1 1 5.75V2.104a.25.25 0 0 1 .427-.177l1.38 1.38A7.002 7.002 0 0 1 14.95 7.16a.75.75 0 0 1-1.49.178A5.5 5.5 0 0 0 8 2.5Z', 'home': 'M6.906.664a1.749 1.749 0 0 1 2.187 0l5.25 4.2c.415.332.657.835.657 1.367v7.019A1.75 1.75 0 0 1 13.25 15h-3.5a.75.75 0 0 1-.75-.75V9H7v5.25a.75.75 0 0 1-.75.75h-3.5A1.75 1.75 0 0 1 1 13.25V6.23c0-.531.242-1.034.657-1.366l5.25-4.2Zm1.25 1.171a.25.25 0 0 0-.312 0l-5.25 4.2a.25.25 0 0 0-.094.196v7.019c0 .138.112.25.25.25H5.5V8.25a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 .75.75v5.25h2.75a.25.25 0 0 0 .25-.25V6.23a.25.25 0 0 0-.094-.195Z', 'github': 'M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z', 'copy': 'M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z', 'check': 'M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z'};
+var utterancesLoad=0;
+
+let themeSettings={
+    "dark": ["dark","moon","#00f0ff","dark-blue"],
+    "light": ["light","sun","#ff5000","github-light"],
+    "auto": ["auto","sync","","preferred-color-scheme"]
+};
+function changeTheme(mode, icon, color, utheme){
+    document.documentElement.setAttribute("data-color-mode",mode);
+    document.getElementById("themeSwitch").setAttribute("d",value=IconList[icon]);
+    document.getElementById("themeSwitch").parentNode.style.color=color;
+    if(utterancesLoad==1){utterancesTheme(utheme);}
+}
+function modeSwitch(){
+    let currentMode=document.documentElement.getAttribute('data-color-mode');
+    let newMode = currentMode === "light" ? "dark" : currentMode === "dark" ? "auto" : "light";
+    localStorage.setItem("meek_theme", newMode);
+    if(themeSettings[newMode]){
+        changeTheme(...themeSettings[newMode]);
+    }
+}
+function utterancesTheme(theme){
+    const message={type:'set-theme',theme: theme};
+    const iframe=document.getElementsByClassName('utterances-frame')[0];
+    iframe.contentWindow.postMessage(message,'https://utteranc.es');
+}
+if(themeSettings[theme]){changeTheme(...themeSettings[theme]);}
+console.log("\n %c Gmeek last https://github.com/Meekdai/Gmeek \n","padding:5px 0;background:#02d81d;color:#fff");
+</script>
+
+<script>
+document.getElementById("pathHome").setAttribute("d",IconList["home"]);
+document.getElementById("pathIssue").setAttribute("d",IconList["github"]);
+
+
+
+function openComments(){
+    cm=document.getElementById("comments");
+    cmButton=document.getElementById("cmButton");
+    cmButton.innerHTML="loading";
+    span=document.createElement("span");
+    span.setAttribute("class","AnimatedEllipsis");
+    cmButton.appendChild(span);
+
+    script=document.createElement("script");
+    script.setAttribute("src","https://utteranc.es/client.js");
+    script.setAttribute("repo","nuowoo/blog");
+    script.setAttribute("issue-term","title");
+    
+    if(localStorage.getItem("meek_theme")=="dark"){script.setAttribute("theme","dark-blue");}
+    else if(localStorage.getItem("meek_theme")=="light") {script.setAttribute("theme","github-light");}
+    else{script.setAttribute("theme","preferred-color-scheme");}
+    
+    script.setAttribute("crossorigin","anonymous");
+    script.setAttribute("async","");
+    cm.appendChild(script);
+
+    int=self.setInterval("iFrameLoading()",200);
+}
+
+function iFrameLoading(){
+    var utterances=document.getElementsByClassName('utterances');
+    if(utterances.length==1){
+        if(utterances[0].style.height!=""){
+            utterancesLoad=1;
+            int=window.clearInterval(int);
+            document.getElementById("cmButton").style.display="none";
+            console.log("utterances Load OK");
+        }
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const createClipboardHTML = (codeContent, additionalClasses = '') => `
+        <pre class="notranslate"><code class="notranslate">${codeContent}</code></pre>
+        <div class="clipboard-container position-absolute right-0 top-0 ${additionalClasses}">
+            <clipboard-copy class="ClipboardButton btn m-2 p-0" role="button" style="display: inherit;">
+                <svg height="16" width="16" class="octicon octicon-copy m-2"><path d="${IconList["copy"]}"></path></svg>
+                <svg height="16" width="16" class="octicon octicon-check color-fg-success m-2 d-none"><path d="${IconList["check"]}"></path></svg>
+            </clipboard-copy>
+            <div class="copy-feedback">Copied!</div>
+        </div>
+    `;
+
+    const handleCodeElements = (selector = '') => {
+        document.querySelectorAll(selector).forEach(codeElement => {
+            const codeContent = codeElement.innerHTML;
+            const newStructure = document.createElement('div');
+            newStructure.className = 'snippet-clipboard-content position-relative overflow-auto';
+            newStructure.innerHTML = createClipboardHTML(codeContent);
+
+            const parentElement = codeElement.parentElement;
+            if (selector.includes('highlight')) {
+                parentElement.insertBefore(newStructure, codeElement.nextSibling);
+                parentElement.removeChild(codeElement);
+            } else {
+                parentElement.parentElement.replaceChild(newStructure, parentElement);
+            }
+        });
+    };
+
+    handleCodeElements('pre.notranslate > code.notranslate');
+    handleCodeElements('div.highlight > pre.notranslate');
+
+    let currentFeedback = null;
+    document.querySelectorAll('clipboard-copy').forEach(copyButton => {
+        copyButton.addEventListener('click', () => {
+            const codeContent = copyButton.closest('.snippet-clipboard-content').innerText;
+            const tempTextArea = document.createElement('textarea');
+            tempTextArea.value = codeContent;
+            document.body.appendChild(tempTextArea);
+            tempTextArea.select();
+            document.execCommand('copy');
+            document.body.removeChild(tempTextArea);
+
+            const copyIcon = copyButton.querySelector('.octicon-copy');
+            const checkIcon = copyButton.querySelector('.octicon-check');
+            const copyFeedback = copyButton.nextElementSibling;
+
+            if (currentFeedback && currentFeedback !== copyFeedback) {currentFeedback.style.display = 'none';}
+            currentFeedback = copyFeedback;
+
+            copyIcon.classList.add('d-none');
+            checkIcon.classList.remove('d-none');
+            copyFeedback.style.display = 'block';
+            copyButton.style.borderColor = 'var(--color-success-fg)';
+
+            setTimeout(() => {
+                copyIcon.classList.remove('d-none');
+                checkIcon.classList.add('d-none');
+                copyFeedback.style.display = 'none';
+                copyButton.style.borderColor = '';
+            }, 2000);
+        });
+    });
+});
+
+</script>
+
+
+</html>
