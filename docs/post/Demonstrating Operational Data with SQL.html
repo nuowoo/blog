@@ -10,8 +10,7 @@
         let theme = localStorage.getItem("meek_theme") || "light";
         document.documentElement.setAttribute("data-color-mode", theme);
     </script>
-<meta name="description" content="
-Databases, Big Data, and Stream Processors have long had the property that it can be hard to *demonstrate* their value, like in a demo setting.
+<meta name="description" content="Databases, Big Data, and Stream Processors have long had the property that it can be hard to *demonstrate* their value, like in a demo setting.
 Databases coordinate the work of multiple teams of independent workers, and don't shine when there is just one user.
 Big Data systems introduce scalable patterns that can be purely overhead when the data fit on a single laptop.
 Stream Processors aim to get the lowest of end-to-end latencies, but do nothing of any consequence on static data.
@@ -876,10 +875,10 @@ SELECT
     get_byte(random, 5)::numeric AS amount,
     auction_start + (get_byte(random, 6)::text || ' minutes')::interval as bid_time
 FROM prework;
-```。">
+```
+<!-- ##{'timestamp':1716094800}## -->。">
 <meta property="og:title" content="Demonstrating Operational Data with SQL">
-<meta property="og:description" content="
-Databases, Big Data, and Stream Processors have long had the property that it can be hard to *demonstrate* their value, like in a demo setting.
+<meta property="og:description" content="Databases, Big Data, and Stream Processors have long had the property that it can be hard to *demonstrate* their value, like in a demo setting.
 Databases coordinate the work of multiple teams of independent workers, and don't shine when there is just one user.
 Big Data systems introduce scalable patterns that can be purely overhead when the data fit on a single laptop.
 Stream Processors aim to get the lowest of end-to-end latencies, but do nothing of any consequence on static data.
@@ -1744,7 +1743,8 @@ SELECT
     get_byte(random, 5)::numeric AS amount,
     auction_start + (get_byte(random, 6)::text || ' minutes')::interval as bid_time
 FROM prework;
-```。">
+```
+<!-- ##{'timestamp':1716094800}## -->。">
 <meta property="og:type" content="article">
 <meta property="og:url" content="https://nuowoo.github.io/blog/post/Demonstrating%20Operational%20Data%20with%20SQL.html">
 <meta property="og:image" content="https://github.githubassets.com/favicons/favicon.svg">
@@ -2487,7 +2487,8 @@ WITH prework <span class="pl-k">AS</span> (
     auction_id,
     get_byte(random, <span class="pl-c1">5</span>)::<span class="pl-k">numeric</span> <span class="pl-k">AS</span> amount,
     auction_start <span class="pl-k">+</span> (get_byte(random, <span class="pl-c1">6</span>)::<span class="pl-k">text</span> <span class="pl-k">||</span> <span class="pl-s"><span class="pl-pds">'</span> minutes<span class="pl-pds">'</span></span>)::interval <span class="pl-k">as</span> bid_time
-<span class="pl-k">FROM</span> prework;</pre></div></div>
+<span class="pl-k">FROM</span> prework;</pre></div>
+</div>
 <div style="font-size:small;margin-top:8px;float:right;"></div>
 
 <button class="btn btn-block" type="button" onclick="openComments()" id="cmButton">评论</button>
