@@ -1,5 +1,10 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Computer Scientist</title><link>https://nuowoo.github.io/blog</link><description>I am a researcher and computer scientist. I used to work in San Francisco, then I traveled a bit</description><copyright>Computer Scientist</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://github.githubassets.com/favicons/favicon.svg</url><title>avatar</title><link>https://nuowoo.github.io/blog</link></image><lastBuildDate>Thu, 10 Oct 2024 06:54:44 +0000</lastBuildDate><managingEditor>Computer Scientist</managingEditor><ttl>60</ttl><webMaster>Computer Scientist</webMaster><item><title>Demonstrating Operational Data with SQL</title><link>https://nuowoo.github.io/blog/post/Demonstrating%20Operational%20Data%20with%20SQL.html</link><description>Databases, Big Data, and Stream Processors have long had the property that it can be hard to *demonstrate* their value, like in a demo setting.&#13;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Computer Scientist</title><link>https://nuowoo.github.io/blog</link><description>I am a researcher and computer scientist. I used to work in San Francisco, then I traveled a bit</description><copyright>Computer Scientist</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://github.githubassets.com/favicons/favicon.svg</url><title>avatar</title><link>https://nuowoo.github.io/blog</link></image><lastBuildDate>Thu, 10 Oct 2024 07:04:33 +0000</lastBuildDate><managingEditor>Computer Scientist</managingEditor><ttl>60</ttl><webMaster>Computer Scientist</webMaster><item><title>Demonstrating Operational Data with SQL</title><link>https://nuowoo.github.io/blog/post/Demonstrating%20Operational%20Data%20with%20SQL.html</link><description>&lt;!-- ##{'script':'&lt;script src='https://udbaa.com/bnr.php?section=GeneralA&amp;pub=847466&amp;format=728x90&amp;ga=g'&gt;&lt;/script&gt;'}## --&gt;&#13;
+&#13;
+&lt;a href='https://yllix.com/publishers/847466' target='_blank'&gt;&lt;img src='//ylx-aff.advertica-cdn.com/pub/728x90.png' style='border:none;margin:0;padding:0;vertical-align:baseline;' alt='ylliX - Online Advertising Network' /&gt;&lt;/a&gt;&#13;
+&#13;
+&#13;
+Databases, Big Data, and Stream Processors have long had the property that it can be hard to *demonstrate* their value, like in a demo setting.&#13;
 Databases coordinate the work of multiple teams of independent workers, and don't shine when there is just one user.&#13;
 Big Data systems introduce scalable patterns that can be purely overhead when the data fit on a single laptop.&#13;
 Stream Processors aim to get the lowest of end-to-end latencies, but do nothing of any consequence on static data.&#13;
@@ -866,10 +871,7 @@ SELECT &#13;
 FROM prework;&#13;
 ```&#13;
 &lt;!-- ##{'timestamp':1716094800}## --&gt;&#13;
-&lt;!-- ##{'script':'&lt;script src='https://udbaa.com/bnr.php?section=GeneralA&amp;pub=847466&amp;format=728x90&amp;ga=g'&gt;&lt;/script&gt;'}## --&gt;&#13;
 &#13;
-&lt;!-- ##{'noscript':'&#13;
-&lt;noscript&gt;&lt;a href='https://yllix.com/publishers/847466' target='_blank'&gt;&lt;img src='//ylx-aff.advertica-cdn.com/pub/728x90.png' style='border:none;margin:0;padding:0;vertical-align:baseline;' alt='ylliX - Online Advertising Network' /&gt;&lt;/a&gt;&lt;/noscript&gt;“}## --》&#13;
 。</description><guid isPermaLink="true">https://nuowoo.github.io/blog/post/Demonstrating%20Operational%20Data%20with%20SQL.html</guid><pubDate>Thu, 10 Oct 2024 05:19:06 +0000</pubDate></item><item><title>Computing and Maintaining Weird (Outer) Joins</title><link>https://nuowoo.github.io/blog/post/Computing%20and%20Maintaining%20Weird%20%28Outer%29%20Joins.html</link><description>[Differential dataflow](https://github.com/TimelyDataflow/differential-dataflow) has a single join operator: `join`.&#13;
 It takes two input collections, and for each `(key, val1)` and `(key, val2)` in the inputs it produces `(key, (val1, val2))` in the output.&#13;
 This makes `join` a 'binary equijoin', where it fishes out exactly the exact matches on `key`.&#13;
