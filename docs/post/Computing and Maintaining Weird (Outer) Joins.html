@@ -10,8 +10,7 @@
         let theme = localStorage.getItem("meek_theme") || "light";
         document.documentElement.setAttribute("data-color-mode", theme);
     </script>
-<meta name="description" content="
-[Differential dataflow](https://github.com/TimelyDataflow/differential-dataflow) has a single join operator: `join`.
+<meta name="description" content="[Differential dataflow](https://github.com/TimelyDataflow/differential-dataflow) has a single join operator: `join`.
 It takes two input collections, and for each `(key, val1)` and `(key, val2)` in the inputs it produces `(key, (val1, val2))` in the output.
 This makes `join` a 'binary equijoin', where it fishes out exactly the exact matches on `key`.
 This restriction is important, and powerful: when either input experiences a change, the `key` of the change is what directs us to the (other) input records that will help us produce the appropriate output change.
@@ -374,10 +373,11 @@ You can understand how in weakly consistent systems you'd need the outer joins t
 Of course, if you've read this far you have an obligation to fill me in on what I've missed about all of this.
 Is there an easier transform, one that doesn't end up joining terms that are themselves sums of useful constituents?
 Do you have an exciting use case for maintaining stacks of outer joins, and you've been burned before?
-Do reach out in these cases, and [take Materialize for a spin](https://materialize.com/register/) (though, if you have stacks of 30+ left joins, please reach out for some personal attention).。">
+Do reach out in these cases, and [take Materialize for a spin](https://materialize.com/register/) (though, if you have stacks of 30+ left joins, please reach out for some personal attention).
+
+<!-- ##{'timestamp':1710738000}## -->。">
 <meta property="og:title" content="Computing and Maintaining Weird (Outer) Joins">
-<meta property="og:description" content="
-[Differential dataflow](https://github.com/TimelyDataflow/differential-dataflow) has a single join operator: `join`.
+<meta property="og:description" content="[Differential dataflow](https://github.com/TimelyDataflow/differential-dataflow) has a single join operator: `join`.
 It takes two input collections, and for each `(key, val1)` and `(key, val2)` in the inputs it produces `(key, (val1, val2))` in the output.
 This makes `join` a 'binary equijoin', where it fishes out exactly the exact matches on `key`.
 This restriction is important, and powerful: when either input experiences a change, the `key` of the change is what directs us to the (other) input records that will help us produce the appropriate output change.
@@ -740,7 +740,9 @@ You can understand how in weakly consistent systems you'd need the outer joins t
 Of course, if you've read this far you have an obligation to fill me in on what I've missed about all of this.
 Is there an easier transform, one that doesn't end up joining terms that are themselves sums of useful constituents?
 Do you have an exciting use case for maintaining stacks of outer joins, and you've been burned before?
-Do reach out in these cases, and [take Materialize for a spin](https://materialize.com/register/) (though, if you have stacks of 30+ left joins, please reach out for some personal attention).。">
+Do reach out in these cases, and [take Materialize for a spin](https://materialize.com/register/) (though, if you have stacks of 30+ left joins, please reach out for some personal attention).
+
+<!-- ##{'timestamp':1710738000}## -->。">
 <meta property="og:type" content="article">
 <meta property="og:url" content="https://nuowoo.github.io/blog/post/Computing%20and%20Maintaining%20Weird%20%28Outer%29%20Joins.html">
 <meta property="og:image" content="https://github.githubassets.com/favicons/favicon.svg">
@@ -1091,7 +1093,8 @@ You can understand how in weakly consistent systems you'd need the outer joins t
 <p>Of course, if you've read this far you have an obligation to fill me in on what I've missed about all of this.<br>
 Is there an easier transform, one that doesn't end up joining terms that are themselves sums of useful constituents?<br>
 Do you have an exciting use case for maintaining stacks of outer joins, and you've been burned before?<br>
-Do reach out in these cases, and <a href="https://materialize.com/register/" rel="nofollow">take Materialize for a spin</a> (though, if you have stacks of 30+ left joins, please reach out for some personal attention).</p></div>
+Do reach out in these cases, and <a href="https://materialize.com/register/" rel="nofollow">take Materialize for a spin</a> (though, if you have stacks of 30+ left joins, please reach out for some personal attention).</p>
+</div>
 <div style="font-size:small;margin-top:8px;float:right;"></div>
 
 <button class="btn btn-block" type="button" onclick="openComments()" id="cmButton">评论</button>

@@ -1,4 +1,3 @@
-
 [Differential dataflow](https://github.com/TimelyDataflow/differential-dataflow) has a single join operator: `join`.
 It takes two input collections, and for each `(key, val1)` and `(key, val2)` in the inputs it produces `(key, (val1, val2))` in the output.
 This makes `join` a "binary equijoin", where it fishes out exactly the exact matches on `key`.
@@ -363,3 +362,5 @@ Of course, if you've read this far you have an obligation to fill me in on what 
 Is there an easier transform, one that doesn't end up joining terms that are themselves sums of useful constituents?
 Do you have an exciting use case for maintaining stacks of outer joins, and you've been burned before?
 Do reach out in these cases, and [take Materialize for a spin](https://materialize.com/register/) (though, if you have stacks of 30+ left joins, please reach out for some personal attention).
+
+<!-- ##{"timestamp":1710738000}## -->
