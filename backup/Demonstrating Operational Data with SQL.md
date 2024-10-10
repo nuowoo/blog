@@ -1,4 +1,4 @@
-<!-- ##{"script":"<script type='text/javascript' src='https://udbaa.com/bnr.php?section=GeneralA&pub=847466&format=728x90&ga=g'></script>"}##-->
+<script type='text/javascript' src='https://udbaa.com/bnr.php?section=GeneralA&pub=847466&format=728x90&ga=g'></script>
 
 
 Databases, Big Data, and Stream Processors have long had the property that it can be hard to *demonstrate* their value, like in a demo setting.
