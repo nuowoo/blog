@@ -1,6 +1,6 @@
-# Computer Scientist :link: https://nuowoo.github.io/blog 
-### :page_facing_up: [8](https://nuowoo.github.io/blog/tag.html) 
+# Computer Scientist :link: http://nuowo.work.gd/ 
+### :page_facing_up: [8](http://nuowo.work.gd//tag.html) 
 ### :speech_balloon: 0 
 ### :hibiscus: 156469 
-### :alarm_clock: 2024-11-10 11:07:36 
+### :alarm_clock: 2024-11-10 14:02:32 
 ### Powered by :heart: [Gmeek](https://github.com/Meekdai/Gmeek)

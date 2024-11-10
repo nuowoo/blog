@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Computer Scientist</title><link>https://nuowoo.github.io/blog</link><description>I am a researcher and computer scientist. I used to work in San Francisco, then I traveled a bit</description><copyright>Computer Scientist</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://github.githubassets.com/favicons/favicon.svg</url><title>avatar</title><link>https://nuowoo.github.io/blog</link></image><lastBuildDate>Thu, 10 Oct 2024 10:55:08 +0000</lastBuildDate><managingEditor>Computer Scientist</managingEditor><ttl>60</ttl><webMaster>Computer Scientist</webMaster><item><title>Demonstrating Operational Data with SQL</title><link>https://nuowoo.github.io/blog/post/Demonstrating%20Operational%20Data%20with%20SQL.html</link><description>Databases, Big Data, and Stream Processors have long had the property that it can be hard to *demonstrate* their value, like in a demo setting.&#13;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Computer Scientist</title><link>http://nuowo.work.gd/</link><description>I am a researcher and computer scientist. I used to work in San Francisco, then I traveled a bit</description><copyright>Computer Scientist</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://github.githubassets.com/favicons/favicon.svg</url><title>avatar</title><link>http://nuowo.work.gd/</link></image><lastBuildDate>Sun, 10 Nov 2024 06:02:32 +0000</lastBuildDate><managingEditor>Computer Scientist</managingEditor><ttl>60</ttl><webMaster>Computer Scientist</webMaster><item><title>Demonstrating Operational Data with SQL</title><link>http://nuowo.work.gd//post/Demonstrating%20Operational%20Data%20with%20SQL.html</link><description>Databases, Big Data, and Stream Processors have long had the property that it can be hard to *demonstrate* their value, like in a demo setting.&#13;
 Databases coordinate the work of multiple teams of independent workers, and don't shine when there is just one user.&#13;
 Big Data systems introduce scalable patterns that can be purely overhead when the data fit on a single laptop.&#13;
 Stream Processors aim to get the lowest of end-to-end latencies, but do nothing of any consequence on static data.&#13;
@@ -867,7 +867,7 @@ FROM prework;&#13;
 ```&#13;
 &lt;!-- ##{'timestamp':1716094800}## --&gt;&#13;
 &#13;
-。</description><guid isPermaLink="true">https://nuowoo.github.io/blog/post/Demonstrating%20Operational%20Data%20with%20SQL.html</guid><pubDate>Thu, 10 Oct 2024 05:19:06 +0000</pubDate></item><item><title>Computing and Maintaining Weird (Outer) Joins</title><link>https://nuowoo.github.io/blog/post/Computing%20and%20Maintaining%20Weird%20%28Outer%29%20Joins.html</link><description>[Differential dataflow](https://github.com/TimelyDataflow/differential-dataflow) has a single join operator: `join`.&#13;
+。</description><guid isPermaLink="true">http://nuowo.work.gd//post/Demonstrating%20Operational%20Data%20with%20SQL.html</guid><pubDate>Thu, 10 Oct 2024 05:19:06 +0000</pubDate></item><item><title>Computing and Maintaining Weird (Outer) Joins</title><link>http://nuowo.work.gd//post/Computing%20and%20Maintaining%20Weird%20%28Outer%29%20Joins.html</link><description>[Differential dataflow](https://github.com/TimelyDataflow/differential-dataflow) has a single join operator: `join`.&#13;
 It takes two input collections, and for each `(key, val1)` and `(key, val2)` in the inputs it produces `(key, (val1, val2))` in the output.&#13;
 This makes `join` a 'binary equijoin', where it fishes out exactly the exact matches on `key`.&#13;
 This restriction is important, and powerful: when either input experiences a change, the `key` of the change is what directs us to the (other) input records that will help us produce the appropriate output change.&#13;
@@ -1232,7 +1232,7 @@ Is there an easier transform, one that doesn't end up joining terms that are the
 Do you have an exciting use case for maintaining stacks of outer joins, and you've been burned before?&#13;
 Do reach out in these cases, and [take Materialize for a spin](https://materialize.com/register/) (though, if you have stacks of 30+ left joins, please reach out for some personal attention).&#13;
 &#13;
-&lt;!-- ##{'timestamp':1710738000}## --&gt;。</description><guid isPermaLink="true">https://nuowoo.github.io/blog/post/Computing%20and%20Maintaining%20Weird%20%28Outer%29%20Joins.html</guid><pubDate>Mon, 18 Mar 2024 05:00:00 +0000</pubDate></item><item><title>Materialize and Advent of Code</title><link>https://nuowoo.github.io/blog/post/Materialize%20and%20Advent%20of%20Code.html</link><description>&#13;
+&lt;!-- ##{'timestamp':1710738000}## --&gt;。</description><guid isPermaLink="true">http://nuowo.work.gd//post/Computing%20and%20Maintaining%20Weird%20%28Outer%29%20Joins.html</guid><pubDate>Mon, 18 Mar 2024 05:00:00 +0000</pubDate></item><item><title>Materialize and Advent of Code</title><link>http://nuowo.work.gd//post/Materialize%20and%20Advent%20of%20Code.html</link><description>&#13;
 &#13;
 This past year Team Materialize struck out to do each day of 2023's [Advent of Code](https://adventofcode.com/2023), an annual programming event with thought-provoking problems that you are encouraged to approach from non-standard directions.&#13;
 We figured we'd try and use SQL for the whole thing.&#13;
@@ -1420,7 +1420,7 @@ Issues ranged from the silly ('why would you name a table `count`?') to the abst
 Finally, the main conclusion was that it was all possible.&#13;
 Despite substantial anxiety about whether and when we would need to bail out, defeated, the whole project did work out.&#13;
 We were able to express a rich variety of computational tasks as data-driven SQL both expressed and maintained by Materialize.&#13;
-&lt;!-- ##{'timestamp':1704171600}## --&gt;。</description><guid isPermaLink="true">https://nuowoo.github.io/blog/post/Materialize%20and%20Advent%20of%20Code.html</guid><pubDate>Tue, 02 Jan 2024 05:00:00 +0000</pubDate></item><item><title>Materialize and Memory</title><link>https://nuowoo.github.io/blog/post/Materialize%20and%20Memory.html</link><description>Materialize keeps your SQL views up to date as the underlying data change.&#13;
+&lt;!-- ##{'timestamp':1704171600}## --&gt;。</description><guid isPermaLink="true">http://nuowo.work.gd//post/Materialize%20and%20Advent%20of%20Code.html</guid><pubDate>Tue, 02 Jan 2024 05:00:00 +0000</pubDate></item><item><title>Materialize and Memory</title><link>http://nuowo.work.gd//post/Materialize%20and%20Memory.html</link><description>Materialize keeps your SQL views up to date as the underlying data change.&#13;
 The value Materialize provides comes from how promptly it reflects new data, but its *cost* comes from the computer resources needed to achieve this.&#13;
 While we often talk about the value Materialize provides, and work continually to improve it, we are also hard at work continually reducing the cost.&#13;
 This work has had marked impact recently, and it felt like a great time to tell you about it, and the reductions in cost. &#13;
@@ -1632,7 +1632,7 @@ The cost optimizations described above are all live in Materialize now.&#13;
 It would be interesting to invite you to see the before and after, but actually we'd love to introduce you to the after, and let you see the next tranche of improvements as they happen.&#13;
 To try out Materialize, sign up at https://materialize.com/register/!&#13;
 &#13;
-&lt;!-- ##{'timestamp':1703048400}## --&gt;。</description><guid isPermaLink="true">https://nuowoo.github.io/blog/post/Materialize%20and%20Memory.html</guid><pubDate>Wed, 20 Dec 2023 05:00:00 +0000</pubDate></item><item><title>Doing Business with Recursive SQL</title><link>https://nuowoo.github.io/blog/post/Doing%20Business%20with%20Recursive%20SQL.html</link><description>&#13;
+&lt;!-- ##{'timestamp':1703048400}## --&gt;。</description><guid isPermaLink="true">http://nuowo.work.gd//post/Materialize%20and%20Memory.html</guid><pubDate>Wed, 20 Dec 2023 05:00:00 +0000</pubDate></item><item><title>Doing Business with Recursive SQL</title><link>http://nuowo.work.gd//post/Doing%20Business%20with%20Recursive%20SQL.html</link><description>&#13;
 Let's take a look at a fundamental problem in economics, with applications to doing business: matching up producers and consumers of some abstract resource, in a way that appeals to all of the participants.&#13;
 &#13;
 Imagine we have a set of producers and a set of consumers, each of whom wants to be matched to one member of the opposite type, and each of them have some (not neccesarily shared) preference for the other.&#13;
@@ -1888,7 +1888,7 @@ We've seen an example of using SQL for one problem that is fundamental in econom
 This certainly isn't the only problem in economics, nor even the most significant business problem you'll have, but it does show off a potentially new use of recursive SQL to solve the problem.&#13;
 Other problems, similar and different, have natural solutions with recursive SQL that you might not have imagined, and you wouldn't be able to access with vanilla SQL.&#13;
 &#13;
-&lt;!-- ##{'timestamp':1702962000}## --&gt;。</description><guid isPermaLink="true">https://nuowoo.github.io/blog/post/Doing%20Business%20with%20Recursive%20SQL.html</guid><pubDate>Tue, 19 Dec 2023 05:00:00 +0000</pubDate></item><item><title>Responsiveness and Operational Agility</title><link>https://nuowoo.github.io/blog/post/Responsiveness%20and%20Operational%20Agility.html</link><description>&#13;
+&lt;!-- ##{'timestamp':1702962000}## --&gt;。</description><guid isPermaLink="true">http://nuowo.work.gd//post/Doing%20Business%20with%20Recursive%20SQL.html</guid><pubDate>Tue, 19 Dec 2023 05:00:00 +0000</pubDate></item><item><title>Responsiveness and Operational Agility</title><link>http://nuowo.work.gd//post/Responsiveness%20and%20Operational%20Agility.html</link><description>&#13;
 Responsiveness is one of three components of [Materialize's Trust pillar of product value](https://materialize.com/blog/operational-attributes/#trust), the other two being [freshness](https://materialize.com/blog/freshness/) and [consistency](https://materialize.com/blog/operational-consistency/).&#13;
 While being fresh and consistent is fundamental, operational work suffers if each intervention is a 15 minute deployment away.&#13;
 We all want to live in world where our operational logic is fully baked, but the reality is that things change and interactivity matters.&#13;
@@ -2070,7 +2070,7 @@ If responsiveness and operational agility sound exciting to you, we invite you t
 Our [guided tutorial](https://www.materialize.com/docs/get-started/quickstart/) builds up the auction data sources described above, and includes demonstrations of consistency.&#13;
 If you'd like to try out Materialize on larger volumes of your own data, reach out about doing a [Proof of Concept](https://materialize.com/trial/) with us!&#13;
 &#13;
-&lt;!-- ##{'timestamp':1696914000}## --&gt;。</description><guid isPermaLink="true">https://nuowoo.github.io/blog/post/Responsiveness%20and%20Operational%20Agility.html</guid><pubDate>Tue, 10 Oct 2023 05:00:00 +0000</pubDate></item><item><title>Freshness and Operational Autonomy</title><link>https://nuowoo.github.io/blog/post/Freshness%20and%20Operational%20Autonomy.html</link><description>&#13;
+&lt;!-- ##{'timestamp':1696914000}## --&gt;。</description><guid isPermaLink="true">http://nuowo.work.gd//post/Responsiveness%20and%20Operational%20Agility.html</guid><pubDate>Tue, 10 Oct 2023 05:00:00 +0000</pubDate></item><item><title>Freshness and Operational Autonomy</title><link>http://nuowo.work.gd//post/Freshness%20and%20Operational%20Autonomy.html</link><description>&#13;
 Freshness is one of three components of [Materialize's Trust pillar of product value](https://materialize.com/blog/operational-attributes/#trust), the other two being responsiveness and [consistency](https://materialize.com/blog/operational-consistency/).&#13;
 Operational work is fundamentally about promptly reacting to and reflecting events in the real world. &#13;
 And the real world, famously, waits for no one.&#13;
@@ -2221,7 +2221,7 @@ If freshness and operational autonomy sound exciting to you, we invite you to tr
 Our [guided tutorial](https://www.materialize.com/docs/get-started/quickstart/) builds up the auction data sources described above, and includes demonstrations of consistency.&#13;
 If you'd like to try out Materialize on larger volumes of your own data, reach out about doing a [Proof of Concept](https://materialize.com/trial/) with us!&#13;
 &#13;
-&lt;!-- ##{'timestamp':1695963600}## --&gt;。</description><guid isPermaLink="true">https://nuowoo.github.io/blog/post/Freshness%20and%20Operational%20Autonomy.html</guid><pubDate>Fri, 29 Sep 2023 05:00:00 +0000</pubDate></item><item><title>Consistency and Operational Confidence</title><link>https://nuowoo.github.io/blog/post/Consistency%20and%20Operational%20Confidence.html</link><description>&#13;
+&lt;!-- ##{'timestamp':1695963600}## --&gt;。</description><guid isPermaLink="true">http://nuowo.work.gd//post/Freshness%20and%20Operational%20Autonomy.html</guid><pubDate>Fri, 29 Sep 2023 05:00:00 +0000</pubDate></item><item><title>Consistency and Operational Confidence</title><link>http://nuowo.work.gd//post/Consistency%20and%20Operational%20Confidence.html</link><description>&#13;
 Consistency is one facet of Materialize's 'Trust' pillar, the others being responsiveness and freshness.&#13;
 It turns out that being super responsive and ultra fresh doesn't amount to much if the results don't make any sense.&#13;
 The last thing you need in your operational data plane is a layer that introduces chaos and confusion, even if it is fast and scalable.&#13;
@@ -2500,4 +2500,4 @@ If this resonates with you, especially if you have heaps of JAR files and Kafka 
 Our [guided tutorial](https://www.materialize.com/docs/get-started/quickstart/) builds up the auction data sources described above, and includes demonstrations of consistency.&#13;
 If you'd like to try out Materialize on larger volumes of your own data, reach out about doing a [Proof of Concept](https://materialize.com/trial/) with us!&#13;
 &#13;
-&lt;!-- ##{'timestamp':1695099600}## --&gt;。</description><guid isPermaLink="true">https://nuowoo.github.io/blog/post/Consistency%20and%20Operational%20Confidence.html</guid><pubDate>Tue, 19 Sep 2023 05:00:00 +0000</pubDate></item></channel></rss>
+&lt;!-- ##{'timestamp':1695099600}## --&gt;。</description><guid isPermaLink="true">http://nuowo.work.gd//post/Consistency%20and%20Operational%20Confidence.html</guid><pubDate>Tue, 19 Sep 2023 05:00:00 +0000</pubDate></item></channel></rss>
